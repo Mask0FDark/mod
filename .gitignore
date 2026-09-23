@@ -13,3 +13,5 @@ apps/android/local.properties
 apps/android/app/build/
 dist/
 artifacts/
+
+edge-headless*/

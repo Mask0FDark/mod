@@ -4,12 +4,45 @@ CREATE TABLE IF NOT EXISTS users (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   email text NOT NULL UNIQUE,
   display_name text NOT NULL CHECK (char_length(display_name) BETWEEN 1 AND 40),
-  password_salt text NOT NULL,
-  password_hash text NOT NULL,
+  auth_secret_salt text,
+  auth_secret_hash text,
+  email_verified_at timestamptz,
+  password_salt text,
+  password_hash text,
   public_key_jwk jsonb NOT NULL,
   encrypted_private_key jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_secret_salt text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_secret_hash text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at timestamptz;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_salt text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name='users' AND column_name='password_salt'
+  ) THEN
+    ALTER TABLE users ALTER COLUMN password_salt DROP NOT NULL;
+    ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS email_verifications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  email text NOT NULL,
+  code_hash text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  attempts integer NOT NULL DEFAULT 0,
+  consumed_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_verifications_email
+  ON email_verifications(email, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash text PRIMARY KEY,
@@ -31,6 +64,23 @@ ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_created_by_fke
 ALTER TABLE conversations
   ADD CONSTRAINT conversations_created_by_fkey
   FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS conversation_invites (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  token_hash text NOT NULL UNIQUE,
+  kind text NOT NULL CHECK (kind IN ('direct','group')),
+  title text,
+  created_by uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conversation_id uuid REFERENCES conversations(id) ON DELETE CASCADE,
+  max_uses integer NOT NULL DEFAULT 1 CHECK (max_uses BETWEEN 1 AND 50),
+  use_count integer NOT NULL DEFAULT 0,
+  expires_at timestamptz NOT NULL,
+  revoked_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_invites_creator
+  ON conversation_invites(created_by, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS conversation_members (
   conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

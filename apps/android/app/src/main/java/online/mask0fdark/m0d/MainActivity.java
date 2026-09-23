@@ -21,7 +21,7 @@ import java.util.List;
 
 public class MainActivity extends Activity {
     private static final int MEDIA_PERMISSION_REQUEST = 1001;
-    private static final String APP_URL = "https://call.mask-0f-darkness.ru/";
+    private static final String APP_URL = BuildConfig.M0D_BASE_URL;
 
     private WebView webView;
     private PermissionRequest pendingWebPermission;

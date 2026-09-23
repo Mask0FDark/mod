@@ -40,6 +40,32 @@ async function passwordKey(password, salt, iterations = 250000) {
   );
 }
 
+export async function deriveAuthSecret(email, password) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const base = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const salt = await crypto.subtle.digest(
+    "SHA-256",
+    enc.encode(`M0D-auth-v1:${normalizedEmail}`)
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: new Uint8Array(salt),
+      iterations: 250000,
+      hash: "SHA-256"
+    },
+    base,
+    256
+  );
+  return bytesToBase64(bits);
+}
+
 export async function createIdentity(password) {
   const pair = await crypto.subtle.generateKey(
     { name: "ECDH", namedCurve: "P-256" },
@@ -121,6 +147,21 @@ async function deriveWrapKey(privateKey, publicKeyJwk, context) {
 
 export async function generateRoomKey() {
   return crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+}
+
+export async function exportRoomKey(roomKey) {
+  const raw = await crypto.subtle.exportKey("raw", roomKey);
+  return bytesToBase64(raw);
+}
+
+export async function importRoomKey(value) {
+  return crypto.subtle.importKey(
+    "raw",
+    base64ToBytes(value),
+    { name: "AES-GCM" },
+    true,
+    ["encrypt", "decrypt"]
+  );
 }
 
 export async function wrapRoomKey(roomKey, privateKey, recipientPublicKeyJwk, context) {

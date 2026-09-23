@@ -5,6 +5,7 @@ import path from "path";
 import { promisify } from "util";
 import { fileURLToPath } from "url";
 import express from "express";
+import nodemailer from "nodemailer";
 import pg from "pg";
 import { WebSocketServer, WebSocket } from "ws";
 
@@ -15,19 +16,35 @@ const webRoot = path.resolve(__dirname, "../web");
 
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL || "";
-const APP_ORIGIN = process.env.APP_ORIGIN || "https://call.mask-0f-darkness.ru";
-const TURN_HOST = process.env.TURN_HOST || "call.mask-0f-darkness.ru";
+const APP_ORIGIN = process.env.APP_ORIGIN || "";
+const TURN_HOST = process.env.TURN_HOST || "";
+const TURN_PORT = Number(process.env.TURN_PORT || 3478);
 const TURN_SECRET = process.env.TURN_SECRET || "";
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const SESSION_DAYS = 30;
 const MAX_UPLOAD = 12 * 1024 * 1024;
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "false") === "true";
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const SMTP_FROM = process.env.SMTP_FROM || "";
+const INVITE_TTL_HOURS = Number(process.env.INVITE_TTL_HOURS || 168);
 
-if (!DATABASE_URL || !TURN_SECRET) {
-  throw new Error("DATABASE_URL and TURN_SECRET are required");
+if (!DATABASE_URL || !TURN_SECRET || !APP_ORIGIN || !TURN_HOST) {
+  throw new Error("DATABASE_URL, TURN_SECRET, APP_ORIGIN and TURN_HOST are required");
 }
 
 fs.mkdirSync(path.join(DATA_DIR, "uploads"), { recursive: true });
 const db = new Pool({ connectionString: DATABASE_URL, max: 10 });
+const mailer = SMTP_HOST && SMTP_FROM
+  ? nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      ...(SMTP_USER && SMTP_PASS ? { auth: { user: SMTP_USER, pass: SMTP_PASS } } : {})
+    })
+  : null;
 const app = express();
 const server = http.createServer(app);
 const socketsByUser = new Map();
@@ -75,13 +92,13 @@ function tokenHash(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-async function hashPassword(password, salt = crypto.randomBytes(16).toString("base64url")) {
-  const key = await scrypt(password, salt, 32);
+async function hashCredential(authSecret, salt = crypto.randomBytes(16).toString("base64url")) {
+  const key = await scrypt(authSecret, salt, 32);
   return { salt, hash: Buffer.from(key).toString("base64url") };
 }
 
-async function verifyPassword(password, salt, expected) {
-  const got = await hashPassword(password, salt);
+async function verifyCredential(authSecret, salt, expected) {
+  const got = await hashCredential(authSecret, salt);
   const a = Buffer.from(got.hash);
   const b = Buffer.from(expected);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
@@ -167,60 +184,173 @@ async function emitConversation(conversationId, payload) {
   for (const userId of await memberIds(conversationId)) emitToUser(userId, payload);
 }
 
+app.post("/api/auth/register/start", async (req, res, next) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const language = ["ru", "en", "uk"].includes(req.body?.language) ? req.body.language : "en";
+    if (!validEmail(email)) return res.status(400).json({ error: "invalid_email" });
+    if (!rateLimit(`verify:${req.ip}:${email}`, 5, 15 * 60_000)) {
+      return res.status(429).json({ error: "too_many_attempts" });
+    }
+    if (!mailer) return res.status(503).json({ error: "mail_not_configured" });
+
+    const existing = await db.query("SELECT 1 FROM users WHERE email=$1", [email]);
+    if (existing.rowCount) return res.status(409).json({ error: "email_exists" });
+
+    const id = crypto.randomUUID();
+    const code = String(crypto.randomInt(100000, 1000000));
+    await db.query(
+      `INSERT INTO email_verifications(id,email,code_hash,expires_at)
+       VALUES($1,$2,$3,now()+interval '10 minutes')`,
+      [id, email, tokenHash(`${id}:${code}`)]
+    );
+
+    const mailCopy = {
+      ru: {
+        subject: "M0D — код подтверждения",
+        text: `Код подтверждения M0D: ${code}\n\nКод действует 10 минут.`
+      },
+      en: {
+        subject: "M0D — verification code",
+        text: `M0D verification code: ${code}\n\nThe code expires in 10 minutes.`
+      },
+      uk: {
+        subject: "M0D — код підтвердження",
+        text: `Код підтвердження M0D: ${code}\n\nКод діє 10 хвилин.`
+      }
+    }[language];
+
+    await mailer.sendMail({
+      from: SMTP_FROM,
+      to: email,
+      subject: mailCopy.subject,
+      text: mailCopy.text
+    });
+    res.json({ verificationId: id, expiresIn: 600 });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.post("/api/auth/register", async (req, res, next) => {
+  const client = await db.connect();
   try {
     const email = normalizeEmail(req.body?.email);
     const displayName = cleanName(req.body?.displayName);
-    const password = String(req.body?.password || "");
+    const authSecret = String(req.body?.authSecret || "");
     const publicKey = req.body?.publicKeyJwk;
     const encryptedPrivateKey = req.body?.encryptedPrivateKey;
+    const verificationId = String(req.body?.verificationId || "");
+    const verificationCode = String(req.body?.code || "");
 
     if (!rateLimit(`reg:${req.ip}`, 8, 10 * 60_000)) {
       return res.status(429).json({ error: "too_many_attempts" });
     }
-    if (!validEmail(email) || !displayName || password.length < 8 || password.length > 128) {
+    if (!validEmail(email) || !displayName || authSecret.length < 32 || authSecret.length > 128) {
       return res.status(400).json({ error: "invalid_registration" });
     }
     if (!publicKey || typeof publicKey !== "object" || !encryptedPrivateKey || typeof encryptedPrivateKey !== "object") {
       return res.status(400).json({ error: "missing_crypto_identity" });
     }
 
-    const { salt, hash } = await hashPassword(password);
-    const result = await db.query(
-      `INSERT INTO users(email,display_name,password_salt,password_hash,public_key_jwk,encrypted_private_key)
-       VALUES($1,$2,$3,$4,$5,$6)
+    await client.query("BEGIN");
+    const verificationResult = await client.query(
+      `SELECT id,email,code_hash,expires_at,attempts,consumed_at
+       FROM email_verifications WHERE id=$1 FOR UPDATE`,
+      [verificationId]
+    );
+    const verification = verificationResult.rows[0];
+    const expectedCodeHash = tokenHash(`${verificationId}:${verificationCode}`);
+    const validVerification = Boolean(
+      verification &&
+      verification.email === email &&
+      !verification.consumed_at &&
+      new Date(verification.expires_at).getTime() >= Date.now() &&
+      verification.attempts < 5 &&
+      verification.code_hash.length === expectedCodeHash.length &&
+      crypto.timingSafeEqual(Buffer.from(verification.code_hash), Buffer.from(expectedCodeHash))
+    );
+
+    if (!validVerification) {
+      if (verification) {
+        await client.query("UPDATE email_verifications SET attempts=attempts+1 WHERE id=$1", [verificationId]);
+        await client.query("COMMIT");
+      } else {
+        await client.query("ROLLBACK");
+      }
+      return res.status(400).json({ error: "verification_invalid" });
+    }
+
+    const { salt, hash } = await hashCredential(authSecret);
+    const result = await client.query(
+      `INSERT INTO users(email,display_name,auth_secret_salt,auth_secret_hash,email_verified_at,public_key_jwk,encrypted_private_key)
+       VALUES($1,$2,$3,$4,now(),$5,$6)
        RETURNING id,email,display_name,public_key_jwk,encrypted_private_key,created_at`,
       [email, displayName, salt, hash, publicKey, encryptedPrivateKey]
     );
+    await client.query(
+      "UPDATE email_verifications SET consumed_at=now(),attempts=attempts+1 WHERE id=$1",
+      [verificationId]
+    );
+    await client.query("COMMIT");
+
     await createSession(res, result.rows[0].id);
     res.status(201).json({ user: result.rows[0] });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     if (err?.code === "23505") return res.status(409).json({ error: "email_exists" });
     next(err);
+  } finally {
+    client.release();
   }
 });
 
 app.post("/api/auth/login", async (req, res, next) => {
   try {
     const email = normalizeEmail(req.body?.email);
-    const password = String(req.body?.password || "");
+    const authSecret = String(req.body?.authSecret || "");
+    const legacyPassword = String(req.body?.password || "");
     if (!rateLimit(`login:${req.ip}`, 20, 10 * 60_000)) {
       return res.status(429).json({ error: "too_many_attempts" });
     }
 
     const result = await db.query(
-      `SELECT id,email,display_name,password_salt,password_hash,public_key_jwk,encrypted_private_key
+      `SELECT id,email,display_name,auth_secret_salt,auth_secret_hash,password_salt,password_hash,
+              public_key_jwk,encrypted_private_key
        FROM users WHERE email=$1`,
       [email]
     );
     const user = result.rows[0];
-    if (!user || !(await verifyPassword(password, user.password_salt, user.password_hash))) {
-      return res.status(401).json({ error: "invalid_credentials" });
+    if (!user) return res.status(401).json({ error: "invalid_credentials" });
+
+    let valid = false;
+    let migrated = false;
+    if (user.auth_secret_salt && user.auth_secret_hash) {
+      valid = await verifyCredential(authSecret, user.auth_secret_salt, user.auth_secret_hash);
+    } else if (user.password_salt && user.password_hash) {
+      if (!legacyPassword) {
+        return res.status(428).json({ error: "legacy_auth_required" });
+      }
+      valid = await verifyCredential(legacyPassword, user.password_salt, user.password_hash);
+      if (valid) {
+        const upgraded = await hashCredential(authSecret);
+        await db.query(
+          `UPDATE users
+           SET auth_secret_salt=$2,auth_secret_hash=$3,password_salt=NULL,password_hash=NULL
+           WHERE id=$1`,
+          [user.id, upgraded.salt, upgraded.hash]
+        );
+        migrated = true;
+      }
     }
+    if (!valid) return res.status(401).json({ error: "invalid_credentials" });
 
     await createSession(res, user.id);
+    delete user.auth_secret_salt;
+    delete user.auth_secret_hash;
     delete user.password_salt;
     delete user.password_hash;
+    user.auth_migrated = migrated;
     res.json({ user });
   } catch (err) {
     next(err);
@@ -242,22 +372,127 @@ app.get("/api/me", auth, (req, res) => {
   res.json({ user: req.user });
 });
 
-app.post("/api/users/resolve", auth, async (req, res, next) => {
+app.post("/api/invites", auth, async (req, res, next) => {
   try {
-    const emails = [...new Set((req.body?.emails || []).map(normalizeEmail))]
-      .filter(validEmail)
-      .slice(0, 20);
-    if (!emails.length) return res.json({ users: [] });
+    const kind = req.body?.kind === "group" ? "group" : "direct";
+    const title = kind === "group" ? cleanName(req.body?.title) : null;
+    if (kind === "group" && !title) return res.status(400).json({ error: "title_required" });
+    if (!rateLimit(`invite:${req.user.id}`, 20, 60 * 60_000)) {
+      return res.status(429).json({ error: "too_many_attempts" });
+    }
 
+    const token = crypto.randomBytes(32).toString("base64url");
+    const maxUses = kind === "direct"
+      ? 1
+      : Math.min(Math.max(Number(req.body?.maxUses || 20), 1), 50);
     const result = await db.query(
-      `SELECT id,email,display_name,public_key_jwk
-       FROM users
-       WHERE email = ANY($1::text[]) AND id<>$2`,
-      [emails, req.user.id]
+      `INSERT INTO conversation_invites(token_hash,kind,title,created_by,max_uses,expires_at)
+       VALUES($1,$2,$3,$4,$5,now()+($6 || ' hours')::interval)
+       RETURNING id,kind,title,max_uses,use_count,expires_at`,
+      [tokenHash(token), kind, title, req.user.id, maxUses, String(INVITE_TTL_HOURS)]
     );
-    res.json({ users: result.rows });
+    res.status(201).json({ token, invite: result.rows[0] });
   } catch (err) {
     next(err);
+  }
+});
+
+app.get("/api/invites/:token", async (req, res, next) => {
+  try {
+    const result = await db.query(
+      `SELECT i.id,i.kind,i.title,i.max_uses,i.use_count,i.expires_at,i.conversation_id,
+              u.id AS creator_id,u.display_name AS creator_name,u.public_key_jwk AS creator_public_key
+       FROM conversation_invites i
+       JOIN users u ON u.id=i.created_by
+       WHERE i.token_hash=$1 AND i.revoked_at IS NULL AND i.expires_at>now() AND i.use_count<i.max_uses`,
+      [tokenHash(req.params.token)]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "invite_invalid" });
+    res.json({ invite: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/api/invites/:token/accept", auth, async (req, res, next) => {
+  const client = await db.connect();
+  try {
+    const selfEnvelope = req.body?.selfEnvelope;
+    const creatorEnvelope = req.body?.creatorEnvelope;
+    if (!selfEnvelope?.iv || !selfEnvelope?.ciphertext) {
+      return res.status(400).json({ error: "missing_key_envelope" });
+    }
+
+    await client.query("BEGIN");
+    const lookup = await client.query(
+      `SELECT i.*,u.public_key_jwk AS creator_public_key
+       FROM conversation_invites i JOIN users u ON u.id=i.created_by
+       WHERE i.token_hash=$1 FOR UPDATE`,
+      [tokenHash(req.params.token)]
+    );
+    const invite = lookup.rows[0];
+    if (!invite || invite.revoked_at || new Date(invite.expires_at).getTime() < Date.now() ||
+        invite.use_count >= invite.max_uses || invite.created_by === req.user.id) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "invite_invalid" });
+    }
+
+    let conversationId = invite.conversation_id;
+    if (!conversationId) {
+      if (!creatorEnvelope?.iv || !creatorEnvelope?.ciphertext) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "missing_creator_envelope" });
+      }
+      const created = await client.query(
+        "INSERT INTO conversations(kind,title,created_by) VALUES($1,$2,$3) RETURNING id",
+        [invite.kind, invite.title, invite.created_by]
+      );
+      conversationId = created.rows[0].id;
+      for (const userId of [invite.created_by, req.user.id]) {
+        await client.query(
+          "INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2)",
+          [conversationId, userId]
+        );
+      }
+      await client.query(
+        `INSERT INTO conversation_keys(conversation_id,user_id,wrapped_by_user_id,iv,ciphertext)
+         VALUES($1,$2,$3,$4,$5),($1,$3,$3,$6,$7)`,
+        [
+          conversationId, invite.created_by, req.user.id,
+          creatorEnvelope.iv, creatorEnvelope.ciphertext,
+          selfEnvelope.iv, selfEnvelope.ciphertext
+        ]
+      );
+    } else {
+      if (invite.kind !== "group") {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "invite_invalid" });
+      }
+      await client.query(
+        "INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        [conversationId, req.user.id]
+      );
+      await client.query(
+        `INSERT INTO conversation_keys(conversation_id,user_id,wrapped_by_user_id,iv,ciphertext)
+         VALUES($1,$2,$2,$3,$4) ON CONFLICT (conversation_id,user_id) DO NOTHING`,
+        [conversationId, req.user.id, selfEnvelope.iv, selfEnvelope.ciphertext]
+      );
+    }
+
+    await client.query(
+      `UPDATE conversation_invites
+       SET conversation_id=$2,use_count=use_count+1
+       WHERE id=$1`,
+      [invite.id, conversationId]
+    );
+    await client.query("COMMIT");
+    await emitConversation(conversationId, { type: "conversation-created", conversationId });
+    res.json({ conversationId });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(err);
+  } finally {
+    client.release();
   }
 });
 
@@ -267,7 +502,7 @@ app.get("/api/conversations", auth, async (req, res, next) => {
       `SELECT c.id,c.kind,c.title,c.created_by,c.created_at,
               ck.iv AS key_iv,ck.ciphertext AS key_ciphertext,ck.wrapped_by_user_id,
               COALESCE(json_agg(json_build_object(
-                'id',u.id,'email',u.email,'displayName',u.display_name,'publicKeyJwk',u.public_key_jwk
+                'id',u.id,'displayName',u.display_name,'publicKeyJwk',u.public_key_jwk
               ) ORDER BY u.display_name) FILTER (WHERE u.id IS NOT NULL),'[]') AS members,
               lm.id AS last_message_id,lm.sender_id AS last_sender_id,
               lm.ciphertext AS last_ciphertext,lm.iv AS last_iv,lm.created_at AS last_message_at
@@ -290,73 +525,6 @@ app.get("/api/conversations", auth, async (req, res, next) => {
     res.json({ conversations: result.rows });
   } catch (err) {
     next(err);
-  }
-});
-
-app.post("/api/conversations", auth, async (req, res, next) => {
-  const client = await db.connect();
-  try {
-    const kind = req.body?.kind === "group" ? "group" : "direct";
-    const title = kind === "group" ? cleanName(req.body?.title) : null;
-    const memberIds = [...new Set((req.body?.memberIds || []).map(String))]
-      .filter(id => id !== req.user.id);
-    const envelopes = req.body?.keyEnvelopes || {};
-
-    if (
-      (kind === "direct" && memberIds.length !== 1) ||
-      (kind === "group" && (memberIds.length < 1 || memberIds.length > 19))
-    ) {
-      return res.status(400).json({ error: "invalid_members" });
-    }
-    if (kind === "group" && !title) return res.status(400).json({ error: "title_required" });
-
-    const allIds = [req.user.id, ...memberIds];
-    const known = await client.query(
-      "SELECT id FROM users WHERE id = ANY($1::uuid[])",
-      [allIds]
-    );
-    if (known.rowCount !== allIds.length) return res.status(400).json({ error: "unknown_member" });
-
-    for (const id of allIds) {
-      const envelope = envelopes[id];
-      if (!envelope?.iv || !envelope?.ciphertext) {
-        return res.status(400).json({ error: "missing_key_envelope" });
-      }
-    }
-
-    await client.query("BEGIN");
-    const created = await client.query(
-      "INSERT INTO conversations(kind,title,created_by) VALUES($1,$2,$3) RETURNING *",
-      [kind, title, req.user.id]
-    );
-    const conversation = created.rows[0];
-
-    for (const userId of allIds) {
-      await client.query(
-        "INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2)",
-        [conversation.id, userId]
-      );
-      await client.query(
-        `INSERT INTO conversation_keys(conversation_id,user_id,wrapped_by_user_id,iv,ciphertext)
-         VALUES($1,$2,$3,$4,$5)`,
-        [
-          conversation.id,
-          userId,
-          req.user.id,
-          envelopes[userId].iv,
-          envelopes[userId].ciphertext
-        ]
-      );
-    }
-
-    await client.query("COMMIT");
-    await emitConversation(conversation.id, { type: "conversation-created", conversationId: conversation.id });
-    res.status(201).json({ conversation });
-  } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    next(err);
-  } finally {
-    client.release();
   }
 });
 
@@ -478,11 +646,11 @@ app.get("/api/ice", auth, (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json({
     iceServers: [
-      { urls: [`stun:${TURN_HOST}:3478`] },
+      { urls: [`stun:${TURN_HOST}:${TURN_PORT}`] },
       {
         urls: [
-          `turn:${TURN_HOST}:3478?transport=udp`,
-          `turn:${TURN_HOST}:3478?transport=tcp`
+          `turn:${TURN_HOST}:${TURN_PORT}?transport=udp`,
+          `turn:${TURN_HOST}:${TURN_PORT}?transport=tcp`
         ],
         username,
         credential

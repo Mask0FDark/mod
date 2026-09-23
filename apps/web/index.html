@@ -36,6 +36,10 @@
           <span data-i18n="password">Пароль</span>
           <input id="passwordInput" type="password" minlength="8" maxlength="128" autocomplete="current-password" required>
         </label>
+        <label id="verificationLabel" class="field hidden">
+          <span data-i18n="verificationCode">Код из письма</span>
+          <input id="verificationCodeInput" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+        </label>
         <button id="authSubmit" class="primary-button" type="submit" data-i18n="login">Войти</button>
         <div id="authError" class="form-error"></div>
       </form>
@@ -137,21 +141,28 @@
       <header>
         <div>
           <h2 data-i18n="newChat">Новый чат</h2>
-          <p data-i18n="newChatHint">Введите email одного или нескольких пользователей.</p>
+          <p data-i18n="newChatHint">Создайте приватную ссылку-приглашение.</p>
         </div>
         <button id="closeNewChatButton" class="round-icon">✕</button>
       </header>
       <label class="field">
-        <span data-i18n="emails">Email участников</span>
-        <textarea id="memberEmailsInput" rows="3" placeholder="name@example.com"></textarea>
+        <span data-i18n="chatType">Тип чата</span>
+        <select id="inviteKindInput">
+          <option value="direct" data-i18n="directChat">Личный чат</option>
+          <option value="group" data-i18n="groupChat">Группа</option>
+        </select>
       </label>
-      <label class="field">
+      <label id="groupTitleLabel" class="field hidden">
         <span data-i18n="groupName">Название группы</span>
-        <input id="groupTitleInput" maxlength="40" data-i18n-placeholder="optional" placeholder="Необязательно">
+        <input id="groupTitleInput" maxlength="40" data-i18n-placeholder="groupNamePlaceholder" placeholder="Название группы">
       </label>
-      <p class="modal-help" data-i18n="groupAutoHint">Один email создаст личный чат. Несколько — группу.</p>
+      <p class="modal-help" data-i18n="invitePrivacyHint">Email собеседника не нужен. Отправьте ему ссылку — после входа или регистрации он сразу попадёт в чат.</p>
+      <div id="inviteResult" class="invite-result hidden">
+        <input id="inviteLinkInput" readonly>
+        <button id="copyInviteButton" class="primary-button" type="button" data-i18n="copyLink">Копировать ссылку</button>
+      </div>
       <div id="newChatError" class="form-error"></div>
-      <button id="createChatButton" class="primary-button" data-i18n="create">Создать</button>
+      <button id="createChatButton" class="primary-button" data-i18n="createInvite">Создать ссылку</button>
     </div>
   </div>
 

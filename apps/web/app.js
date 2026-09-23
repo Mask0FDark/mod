@@ -1,8 +1,11 @@
 import { applyTranslations, getLanguage, setLanguage, t } from "./i18n.js";
 import {
   createIdentity,
+  deriveAuthSecret,
   unlockPrivateKey,
   generateRoomKey,
+  exportRoomKey,
+  importRoomKey,
   wrapRoomKey,
   unwrapRoomKey,
   encryptJson,
@@ -22,6 +25,8 @@ const ui = {
   nameInput: $("nameInput"),
   emailInput: $("emailInput"),
   passwordInput: $("passwordInput"),
+  verificationLabel: $("verificationLabel"),
+  verificationCodeInput: $("verificationCodeInput"),
   authSubmit: $("authSubmit"),
   authError: $("authError"),
   sidebar: $("sidebar"),
@@ -52,8 +57,12 @@ const ui = {
   closeDrawerButton: $("closeDrawerButton"),
   newChatModal: $("newChatModal"),
   closeNewChatButton: $("closeNewChatButton"),
-  memberEmailsInput: $("memberEmailsInput"),
+  inviteKindInput: $("inviteKindInput"),
+  groupTitleLabel: $("groupTitleLabel"),
   groupTitleInput: $("groupTitleInput"),
+  inviteResult: $("inviteResult"),
+  inviteLinkInput: $("inviteLinkInput"),
+  copyInviteButton: $("copyInviteButton"),
   newChatError: $("newChatError"),
   createChatButton: $("createChatButton"),
   callOverlay: $("callOverlay"),
@@ -79,6 +88,8 @@ const ui = {
 
 const state = {
   authMode: "login",
+  verificationId: null,
+  pendingInvite: null,
   me: null,
   privateKey: null,
   conversations: [],
@@ -182,6 +193,9 @@ function setAuthMode(mode) {
   ui.loginTab.classList.toggle("active", !register);
   ui.registerTab.classList.toggle("active", register);
   ui.nameLabel.classList.toggle("hidden", !register);
+  state.verificationId = null;
+  ui.verificationLabel.classList.add("hidden");
+  ui.verificationCodeInput.value = "";
   ui.authSubmit.dataset.i18n = register ? "register" : "login";
   ui.passwordInput.autocomplete = register ? "new-password" : "current-password";
   applyTranslations();
@@ -191,7 +205,9 @@ function setAuthMode(mode) {
 function mapAuthError(error) {
   if (error.code === "email_exists") return t("emailExists");
   if (error.code === "invalid_credentials") return t("invalidCredentials");
-  if (error.code === "invalid_registration") return t("invalidRegistration");
+  if (error.code === "invalid_registration" || error.code === "invalid_email") return t("invalidRegistration");
+  if (error.code === "verification_invalid") return t("verificationInvalid");
+  if (error.code === "mail_not_configured") return t("mailUnavailable");
   return t("serverError");
 }
 
@@ -203,6 +219,21 @@ async function submitAuth(event) {
   const password = ui.passwordInput.value;
 
   try {
+    if (state.authMode === "register" && !state.verificationId) {
+      const started = await api("/api/auth/register/start", {
+        method: "POST",
+        body: JSON.stringify({ email, language: getLanguage() })
+      });
+      state.verificationId = started.verificationId;
+      ui.verificationLabel.classList.remove("hidden");
+      ui.authSubmit.dataset.i18n = "verifyAndRegister";
+      applyTranslations();
+      ui.authError.textContent = t("verificationSent");
+      ui.verificationCodeInput.focus();
+      return;
+    }
+
+    const authSecret = await deriveAuthSecret(email, password);
     if (state.authMode === "register") {
       const displayName = ui.nameInput.value.trim();
       const identity = await createIdentity(password);
@@ -210,8 +241,10 @@ async function submitAuth(event) {
         method: "POST",
         body: JSON.stringify({
           email,
-          password,
+          authSecret,
           displayName,
+          verificationId: state.verificationId,
+          code: ui.verificationCodeInput.value.trim(),
           publicKeyJwk: identity.publicKeyJwk,
           encryptedPrivateKey: identity.encryptedPrivateKey
         })
@@ -220,10 +253,19 @@ async function submitAuth(event) {
       state.privateKey = identity.pair.privateKey;
       await identitySet(state.me.id, state.privateKey);
     } else {
-      const result = await api("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ email, password })
-      });
+      let result;
+      try {
+        result = await api("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email, authSecret })
+        });
+      } catch (error) {
+        if (error.code !== "legacy_auth_required") throw error;
+        result = await api("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ email, authSecret, password })
+        });
+      }
       state.me = result.user;
       state.privateKey = await unlockPrivateKey(state.me.encrypted_private_key, password);
       await identitySet(state.me.id, state.privateKey);
@@ -241,7 +283,7 @@ async function submitAuth(event) {
 function conversationName(conversation) {
   if (conversation.kind === "group") return conversation.title || t("group");
   const other = conversation.members.find(member => member.id !== state.me.id);
-  return other?.displayName || other?.display_name || other?.email || "M0D";
+  return other?.displayName || other?.display_name || "M0D";
 }
 
 function directPeer(conversation) {
@@ -604,85 +646,89 @@ async function sendFile(file) {
   });
 }
 
-async function createConversation() {
-  ui.newChatError.textContent = "";
-  const emails = [...new Set(
-    ui.memberEmailsInput.value
-      .split(/[\s,;]+/)
-      .map(value => value.trim().toLowerCase())
-      .filter(Boolean)
-  )];
+function capturePendingInvite() {
+  const match = location.pathname.match(/^\/invite\/([A-Za-z0-9_-]+)\/?$/);
+  const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const roomKey = fragment.get("k");
+  state.pendingInvite = match && roomKey ? { token: match[1], roomKey } : null;
+}
 
-  if (!emails.length) {
-    ui.newChatError.textContent = t("userNotFound");
+async function createInvite() {
+  ui.newChatError.textContent = "";
+  ui.inviteResult.classList.add("hidden");
+  const kind = ui.inviteKindInput.value === "group" ? "group" : "direct";
+  const title = ui.groupTitleInput.value.trim();
+  if (kind === "group" && !title) {
+    ui.newChatError.textContent = t("groupNameRequired");
     return;
   }
 
   ui.createChatButton.disabled = true;
   try {
-    const resolved = await api("/api/users/resolve", {
-      method: "POST",
-      body: JSON.stringify({ emails })
-    });
-    if (resolved.users.length !== emails.length) {
-      ui.newChatError.textContent = t("userNotFound");
-      return;
-    }
-
-    const kind = emails.length === 1 ? "direct" : "group";
-    const title = ui.groupTitleInput.value.trim();
-    if (kind === "group" && !title) {
-      ui.newChatError.textContent = t("groupName");
-      return;
-    }
-
     const roomKey = await generateRoomKey();
-    const context = crypto.randomUUID();
-    const recipients = [
-      {
-        id: state.me.id,
-        publicKeyJwk: state.me.public_key_jwk
-      },
-      ...resolved.users.map(user => ({
-        id: user.id,
-        publicKeyJwk: user.public_key_jwk
-      }))
-    ];
+    const exported = await exportRoomKey(roomKey);
+    const result = await api("/api/invites", {
+      method: "POST",
+      body: JSON.stringify({ kind, title: kind === "group" ? title : null })
+    });
+    const link = `${location.origin}/invite/${result.token}#k=${encodeURIComponent(exported)}`;
+    ui.inviteLinkInput.value = link;
+    ui.inviteResult.classList.remove("hidden");
+    ui.createChatButton.dataset.i18n = "createAnotherInvite";
+    applyTranslations();
+  } catch {
+    ui.newChatError.textContent = t("inviteCreateFailed");
+  } finally {
+    ui.createChatButton.disabled = false;
+  }
+}
 
-    const keyEnvelopes = {};
-    for (const recipient of recipients) {
-      const wrapped = await wrapRoomKey(
-        roomKey,
-        state.privateKey,
-        recipient.publicKeyJwk,
-        context
+async function acceptPendingInvite() {
+  if (!state.pendingInvite || !state.me || !state.privateKey) return;
+  const { token, roomKey: encodedRoomKey } = state.pendingInvite;
+  try {
+    const info = await api(`/api/invites/${token}`);
+    const invite = info.invite;
+    if (invite.creator_id === state.me.id) {
+      showToast(t("ownInvite"));
+      return;
+    }
+
+    const roomKey = await importRoomKey(encodedRoomKey);
+    const context = `invite:${token}`;
+    const selfWrapped = await wrapRoomKey(
+      roomKey, state.privateKey, state.me.public_key_jwk, context
+    );
+    let creatorEnvelope = null;
+    if (!invite.conversation_id) {
+      const creatorWrapped = await wrapRoomKey(
+        roomKey, state.privateKey, invite.creator_public_key, context
       );
-      keyEnvelopes[recipient.id] = {
-        iv: wrapped.iv,
-        ciphertext: JSON.stringify({ context, data: wrapped.ciphertext })
+      creatorEnvelope = {
+        iv: creatorWrapped.iv,
+        ciphertext: JSON.stringify({ context, data: creatorWrapped.ciphertext })
       };
     }
 
-    const result = await api("/api/conversations", {
+    const accepted = await api(`/api/invites/${token}/accept`, {
       method: "POST",
       body: JSON.stringify({
-        kind,
-        title: kind === "group" ? title : null,
-        memberIds: resolved.users.map(user => user.id),
-        keyEnvelopes
+        selfEnvelope: {
+          iv: selfWrapped.iv,
+          ciphertext: JSON.stringify({ context, data: selfWrapped.ciphertext })
+        },
+        creatorEnvelope
       })
     });
 
-    state.roomKeys.set(result.conversation.id, roomKey);
-    ui.newChatModal.classList.add("hidden");
-    ui.memberEmailsInput.value = "";
-    ui.groupTitleInput.value = "";
+    state.pendingInvite = null;
+    history.replaceState(null, "", "/");
+    state.roomKeys.set(accepted.conversationId, roomKey);
     await loadConversations();
-    await openConversation(result.conversation.id);
+    await openConversation(accepted.conversationId);
+    showToast(t("inviteAccepted"));
   } catch {
-    ui.newChatError.textContent = t("chatCreateFailed");
-  } finally {
-    ui.createChatButton.disabled = false;
+    showToast(t("inviteInvalid"));
   }
 }
 
@@ -1203,10 +1249,12 @@ async function enterMessenger() {
   state.roomKeys.clear();
   await loadConversations();
   connectSocket();
+  if (state.pendingInvite) await acceptPendingInvite();
 }
 
 async function boot() {
   applyTranslations();
+  capturePendingInvite();
 
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
@@ -1217,6 +1265,7 @@ async function boot() {
     result = await api("/api/me");
   } catch (error) {
     ui.authView.classList.remove("hidden");
+    if (state.pendingInvite) ui.authError.textContent = t("inviteAfterAuth");
     return;
   }
 
@@ -1248,11 +1297,24 @@ document.querySelectorAll(".language-button").forEach(button => {
 
 ui.newChatButton.addEventListener("click", () => {
   ui.newChatError.textContent = "";
+  ui.inviteResult.classList.add("hidden");
+  ui.inviteLinkInput.value = "";
+  ui.createChatButton.dataset.i18n = "createInvite";
+  applyTranslations();
   ui.newChatModal.classList.remove("hidden");
-  setTimeout(() => ui.memberEmailsInput.focus(), 50);
+  setTimeout(() => ui.inviteKindInput.focus(), 50);
 });
 ui.closeNewChatButton.addEventListener("click", () => ui.newChatModal.classList.add("hidden"));
-ui.createChatButton.addEventListener("click", createConversation);
+ui.inviteKindInput.addEventListener("change", () => {
+  const group = ui.inviteKindInput.value === "group";
+  ui.groupTitleLabel.classList.toggle("hidden", !group);
+});
+ui.copyInviteButton.addEventListener("click", async () => {
+  if (!ui.inviteLinkInput.value) return;
+  await navigator.clipboard.writeText(ui.inviteLinkInput.value);
+  showToast(t("linkCopied"));
+});
+ui.createChatButton.addEventListener("click", createInvite);
 ui.newChatModal.addEventListener("click", event => {
   if (event.target === ui.newChatModal) ui.newChatModal.classList.add("hidden");
 });
