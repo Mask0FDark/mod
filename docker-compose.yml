@@ -1,0 +1,58 @@
+services:
+  app:
+    build: .
+    container_name: m0d-app
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - m0d_data:/data
+    ports:
+      - "127.0.0.1:8095:3000"
+    security_opt:
+      - no-new-privileges:true
+
+  db:
+    image: postgres:16-alpine
+    container_name: m0d-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - m0d_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  turn:
+    image: coturn/coturn:4.6.3
+    container_name: m0d-turn
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    command:
+      - -n
+      - --log-file=stdout
+      - --realm=call.mask-0f-darkness.ru
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET}
+      - --listening-ip=0.0.0.0
+      - --listening-port=3478
+      - --external-ip=135.106.168.43
+      - --min-port=49160
+      - --max-port=49200
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --no-multicast-peers
+
+volumes:
+  m0d_pg:
+  m0d_data:

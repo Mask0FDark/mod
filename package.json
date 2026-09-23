@@ -1,0 +1,15 @@
+{
+  "name": "m0d",
+  "version": "0.1.0",
+  "private": true,
+  "description": "M0D — Message Over Distance",
+  "scripts": {
+    "start": "node apps/server/server.js",
+    "check": "node --check apps/server/server.js && node --check apps/web/app.js && node --check apps/web/crypto.js && node --check apps/web/i18n.js"
+  },
+  "dependencies": {
+    "express": "4.22.3",
+    "pg": "8.16.3",
+    "ws": "8.21.3"
+  }
+}
