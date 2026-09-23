@@ -54,9 +54,7 @@ public class MainActivity extends Activity {
             }
         });
 
-        if (BuildConfig.DEBUG) {
-            WebView.setWebContentsDebuggingEnabled(true);
-        }
+        WebView.setWebContentsDebuggingEnabled(false);
 
         requestMediaPermissions();
         webView.loadUrl(APP_URL);
