@@ -22,9 +22,15 @@ CREATE TABLE IF NOT EXISTS conversations (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   kind text NOT NULL CHECK (kind IN ('direct','group')),
   title text,
-  created_by uuid NOT NULL REFERENCES users(id),
+  created_by uuid REFERENCES users(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE conversations ALTER COLUMN created_by DROP NOT NULL;
+ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_created_by_fkey;
+ALTER TABLE conversations
+  ADD CONSTRAINT conversations_created_by_fkey
+  FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS conversation_members (
   conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

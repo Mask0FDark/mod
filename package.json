@@ -2,6 +2,7 @@
   "name": "m0d",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "M0D — Message Over Distance",
   "scripts": {
     "start": "node apps/server/server.js",
