@@ -163,6 +163,12 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id bigint;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_root_id bigint;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at timestamptz;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_message_id uuid;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS request_hash text;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_request
+  ON messages(conversation_id, sender_id, client_message_id)
+  WHERE client_message_id IS NOT NULL;
 
 DO $$
 BEGIN

@@ -1,8 +1,8 @@
-const CACHE = "m0d-shell-v2";
+const CACHE = "m0d-shell-v3-delivery";
 const SHELL = ["/", "/styles.css", "/app.js", "/crypto.js", "/i18n.js", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", event => {
-  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)));
+  event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL.map(url => new Request(url, { cache: "reload" })))));
   self.skipWaiting();
 });
 
@@ -20,7 +20,9 @@ self.addEventListener("fetch", event => {
     fetch(event.request)
       .then(response => {
         const copy = response.clone();
-        caches.open(CACHE).then(cache => cache.put(event.request, copy));
+        if (response.ok && url.origin === self.location.origin) {
+          caches.open(CACHE).then(cache => cache.put(event.request, copy)).catch(() => {});
+        }
         return response;
       })
       .catch(() => caches.match(event.request))

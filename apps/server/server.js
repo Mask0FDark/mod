@@ -29,6 +29,8 @@ const SMTP_SECURE = String(process.env.SMTP_SECURE || "false") === "true";
 const SMTP_USER = process.env.SMTP_USER || "";
 const SMTP_PASS = process.env.SMTP_PASS || "";
 const SMTP_FROM = process.env.SMTP_FROM || "";
+// Mailpit/MailHog capture messages but never deliver them to the recipient.
+const SMTP_TEST_ONLY = /mailpit|mailhog/i.test(SMTP_HOST) || process.env.SMTP_TEST_ONLY === "true";
 const INVITE_TTL_HOURS = Number(process.env.INVITE_TTL_HOURS || 168);
 
 if (!DATABASE_URL || !TURN_SECRET || !APP_ORIGIN || !TURN_HOST) {
@@ -219,7 +221,9 @@ app.post("/api/auth/register/start", async (req, res, next) => {
     if (!rateLimit(`verify:${req.ip}:${email}`, 5, 15 * 60_000)) {
       return res.status(429).json({ error: "too_many_attempts" });
     }
-    if (!mailer) return res.status(503).json({ error: "mail_not_configured" });
+    if (!mailer || (SMTP_TEST_ONLY && !email.endsWith("@example.test"))) {
+      return res.status(503).json({ error: "mail_not_configured" });
+    }
 
     const existing = await db.query("SELECT 1 FROM users WHERE email=$1", [email]);
     if (existing.rowCount) return res.status(409).json({ error: "email_exists" });
@@ -799,6 +803,11 @@ app.get("/api/conversations/:id/messages", auth, async (req, res, next) => {
     const before = Number(req.query.before || Number.MAX_SAFE_INTEGER);
     const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
     const requestedThread = req.query.threadRootId ? Number(req.query.threadRootId) : null;
+    if (!Number.isSafeInteger(before) || before < 1 || !Number.isInteger(limit) ||
+        (requestedThread !== null && (!Number.isSafeInteger(requestedThread) || requestedThread < 1))) {
+      return res.status(400).json({ error: "invalid_pagination" });
+    }
+    if (requestedThread && member.kind !== "channel") return res.status(400).json({ error: "threads_channel_only" });
     const threadClause = member.kind === "channel"
       ? (requestedThread ? "AND m.thread_root_id=$4" : "AND m.thread_root_id IS NULL")
       : "AND m.thread_root_id IS NULL";
@@ -848,9 +857,30 @@ app.post("/api/conversations/:id/messages", auth, async (req, res, next) => {
     const attachmentId = req.body?.attachmentId || null;
     const replyToId = req.body?.replyToId ? Number(req.body.replyToId) : null;
     const threadRootId = req.body?.threadRootId ? Number(req.body.threadRootId) : null;
+    const clientMessageId = req.body?.clientMessageId || null;
 
     if (!ciphertext || ciphertext.length > 200_000 || !iv || iv.length > 200) {
       return res.status(400).json({ error: "invalid_message" });
+    }
+    if (clientMessageId !== null && (typeof clientMessageId !== "string" ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clientMessageId))) {
+      return res.status(400).json({ error: "invalid_client_message_id" });
+    }
+    const requestHash = clientMessageId ? tokenHash(JSON.stringify([ciphertext, iv, attachmentId, replyToId, threadRootId])) : null;
+    const existingRequest = async () => {
+      const existing = await db.query(
+        `SELECT * FROM messages WHERE conversation_id=$1 AND sender_id=$2 AND client_message_id=$3`,
+        [conversationId, req.user.id, clientMessageId]
+      );
+      return existing.rows[0];
+    };
+    const replay = message => {
+      if (message.request_hash !== requestHash) return res.status(409).json({ error: "client_message_id_conflict" });
+      return res.json({ message, replayed: true });
+    };
+    if (clientMessageId) {
+      const existing = await existingRequest();
+      if (existing) return replay(existing);
     }
 
     if (member.kind === "channel") {
@@ -886,12 +916,15 @@ app.post("/api/conversations/:id/messages", auth, async (req, res, next) => {
     }
 
     const result = await db.query(
-      `INSERT INTO messages(conversation_id,sender_id,ciphertext,iv,attachment_id,reply_to_id,thread_root_id)
-       VALUES($1,$2,$3,$4,$5,$6,$7)
+      `INSERT INTO messages(conversation_id,sender_id,ciphertext,iv,attachment_id,reply_to_id,thread_root_id,client_message_id,request_hash)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (conversation_id,sender_id,client_message_id) WHERE client_message_id IS NOT NULL
+       DO NOTHING
        RETURNING id,conversation_id,sender_id,ciphertext,iv,attachment_id,reply_to_id,thread_root_id,
-                 edited_at,deleted_at,created_at`,
-      [conversationId, req.user.id, ciphertext, iv, attachmentId, replyToId, threadRootId]
+                 edited_at,deleted_at,created_at,client_message_id`,
+      [conversationId, req.user.id, ciphertext, iv, attachmentId, replyToId, threadRootId, clientMessageId, requestHash]
     );
+    if (!result.rowCount) return replay(await existingRequest());
 
     const message = { ...result.rows[0], reactions: [], pinned: false, comment_count: 0 };
     await emitConversation(conversationId, { type: "message", message });
@@ -1046,17 +1079,21 @@ app.post("/api/conversations/:id/messages/:messageId/pin", auth, async (req, res
 app.post("/api/conversations/:id/read", auth, async (req, res, next) => {
   try {
     const conversationId = req.params.id;
-    const messageId = Math.max(0, Number(req.body?.messageId || 0));
+    const messageId = Number(req.body?.messageId || 0);
+    if (!Number.isSafeInteger(messageId) || messageId < 1) return res.status(400).json({ error: "invalid_message_id" });
     if (!(await isMember(req.user.id, conversationId))) {
       return res.status(403).json({ error: "forbidden" });
     }
-    await db.query(
+    const target = await db.query("SELECT 1 FROM messages WHERE conversation_id=$1 AND id=$2", [conversationId, messageId]);
+    if (!target.rowCount) return res.status(400).json({ error: "invalid_message_id" });
+    const result = await db.query(
       `UPDATE conversation_members
        SET last_read_message_id=GREATEST(last_read_message_id,$3)
-       WHERE conversation_id=$1 AND user_id=$2`,
+       WHERE conversation_id=$1 AND user_id=$2 AND last_read_message_id<$3
+       RETURNING last_read_message_id`,
       [conversationId, req.user.id, messageId]
     );
-    await emitConversation(conversationId, {
+    if (result.rowCount) await emitConversation(conversationId, {
       type: "read",
       conversationId,
       userId: req.user.id,
@@ -1256,7 +1293,7 @@ wss.on("connection", async (ws, req) => {
   });
 });
 
-app.use(express.static(webRoot, { etag: true, maxAge: "1h", extensions: ["html"] }));
+app.use(express.static(webRoot, { etag: true, maxAge: 0, extensions: ["html"] }));
 app.get("*", (req, res) => res.sendFile(path.join(webRoot, "index.html")));
 
 app.use((err, req, res, next) => {

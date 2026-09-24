@@ -813,7 +813,7 @@ button, .chat-row { -webkit-tap-highlight-color: transparent; }
 .reply-preview{display:block;width:100%;margin:0 0 6px;padding:5px 8px;border:0;border-left:3px solid var(--accent);border-radius:5px;background:rgba(42,171,238,.08);color:#b9dff3;text-align:left;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;cursor:pointer}
 .message-actions{position:absolute;top:-28px;right:4px;display:none;gap:3px;padding:3px;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:#1d2935;box-shadow:0 5px 16px rgba(0,0,0,.24)}
 .message-row.in .message-actions{right:auto;left:4px}
-.message-bubble:hover .message-actions{display:flex}
+.message-row:hover .message-actions,.message-bubble:focus-within .message-actions{display:flex}
 .message-actions button{width:28px;height:26px;border:0;border-radius:7px;background:transparent;color:#c8d2dc;cursor:pointer}.message-actions button:hover{background:rgba(255,255,255,.08)}
 .message-bubble.deleted{opacity:.72}.deleted-text{font-style:italic;color:var(--muted)}
 .message-highlight .message-bubble{box-shadow:0 0 0 2px rgba(42,171,238,.65)}

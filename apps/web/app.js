@@ -135,6 +135,17 @@ const state = {
   threadRoot: null,
   typingTimer: null,
   remoteTypingTimer: null,
+  messageView: { epoch: 0, request: 0, writes: new Map() },
+  threadView: { epoch: 0, request: 0, writes: new Map() },
+  conversationRequest: 0,
+  conversationLoad: null,
+  readRequests: new Map(),
+  sendingText: false,
+  sendingThread: false,
+  pendingSends: new Map(),
+  drafts: new Map(),
+  reconnectTimer: null,
+  seenMessages: new Set(),
   call: {
     state: "idle",
     peerId: null,
@@ -458,20 +469,36 @@ async function renderConversationList() {
   }
 }
 
-async function loadConversations() {
+function loadConversations() {
+  const request = ++state.conversationRequest;
+  const pending = refreshConversations(request);
+  state.conversationLoad = pending;
+  return pending;
+}
+
+async function refreshConversations(request) {
   const result = await api("/api/conversations");
+  if (!state.me) return;
+  // A caller that needs the list (e.g. accepting an invite) must wait until
+  // the newer refresh is applied, not continue with an out-of-date list.
+  if (request !== state.conversationRequest) return state.conversationLoad;
+  const previous = new Map(state.conversations.map(c => [c.id, c]));
   state.conversations = result.conversations || [];
   for (const conversation of state.conversations) {
-    try {
-      await unlockConversationKey(conversation);
-    } catch {}
+    // A list request may have started before a read acknowledgement arrived.
+    const old = previous.get(conversation.id);
+    conversation.last_read_message_id = Math.max(Number(conversation.last_read_message_id || 0), Number(old?.last_read_message_id || 0));
+    for (const member of conversation.members) {
+      const known = old?.members?.find(m => m.id === member.id);
+      member.lastReadMessageId = Math.max(Number(member.lastReadMessageId || 0), Number(known?.lastReadMessageId || 0));
+    }
   }
-  await renderConversationList();
-
   if (state.activeConversation) {
     const refreshed = state.conversations.find(c => c.id === state.activeConversation.id);
     if (refreshed) state.activeConversation = refreshed;
   }
+  await renderConversationList();
+  updateChatHeader();
 }
 
 function updateChatHeader() {
@@ -504,21 +531,76 @@ function clearComposerContext() {
 
 async function markConversationRead(messageId) {
   const conversation = state.activeConversation;
-  if (!conversation || !messageId) return;
-  conversation.unread_count = 0;
-  conversation.last_read_message_id = Math.max(Number(conversation.last_read_message_id || 0), Number(messageId));
-  await renderConversationList();
-  api(`/api/conversations/${conversation.id}/read`, {
-    method: "POST",
-    body: JSON.stringify({ messageId })
-  }).catch(() => {});
+  const id = Number(messageId);
+  if (!conversation || !Number.isSafeInteger(id) || id < 1 || document.hidden) return;
+  if (ui.activeChat.classList.contains("hidden")) return;
+  if (matchMedia("(max-width: 760px)").matches && !ui.appView.classList.contains("chat-open")) return;
+  const pending = state.readRequests.get(conversation.id) || 0;
+  if (id <= Math.max(Number(conversation.last_read_message_id || 0), pending)) return;
+  state.readRequests.set(conversation.id, id);
+  try {
+    await api(`/api/conversations/${conversation.id}/read`, {
+      method: "POST", body: JSON.stringify({ messageId: id })
+    });
+    const current = state.conversations.find(c => c.id === conversation.id) || conversation;
+    current.last_read_message_id = Math.max(Number(current.last_read_message_id || 0), id);
+    // Do not erase an unread message that arrived during this request.
+    if (id >= Number(current.last_message_id || 0)) current.unread_count = 0;
+    await renderConversationList();
+  } catch {
+    // Leave the cursor unchanged so visibility/scroll/reconnect can retry it.
+  } finally {
+    if (state.readRequests.get(conversation.id) === id) state.readRequests.delete(conversation.id);
+  }
+}
+
+function resetMessageView(host, view) {
+  view.epoch += 1;
+  view.request += 1;
+  view.writes.clear();
+  host.replaceChildren();
+}
+
+function nearMessageBottom(host) {
+  return host.scrollHeight - host.scrollTop - host.clientHeight < 90;
+}
+
+function markVisibleMessagesRead() {
+  if (nearMessageBottom(ui.messageList)) {
+    const last = ui.messageList.lastElementChild?.dataset.messageId;
+    if (last) markConversationRead(last);
+  }
+}
+
+function updateReadReceipts() {
+  const conversation = state.activeConversation;
+  if (conversation?.kind !== "direct") return;
+  const readThrough = Number(directPeer(conversation)?.lastReadMessageId || 0);
+  for (const row of ui.messageList.querySelectorAll(".message-row.out")) {
+    const receipt = row.querySelector(".message-receipt");
+    if (receipt) receipt.textContent = Number(row.dataset.messageId) <= readThrough ? " ✓✓" : " ✓";
+  }
 }
 
 async function openConversation(id) {
   const conversation = state.conversations.find(c => c.id === id);
   if (!conversation) return;
+  if (state.activeConversation) {
+    state.drafts.set(state.activeConversation.id, { text: ui.messageInput.value, reply: state.replyTo, editing: state.editingMessage });
+  }
+  resetMessageView(ui.messageList, state.messageView);
+  resetMessageView(ui.threadMessageList, state.threadView);
+  state.messageCache.clear();
+  ui.threadModal.classList.add("hidden");
+  ui.messageInput.value = "";
+  clearTimeout(state.remoteTypingTimer);
   state.activeConversation = conversation;
   clearComposerContext();
+  const draft = state.drafts.get(id);
+  ui.messageInput.value = draft?.text || "";
+  if (draft?.editing) beginEdit(draft.editing, { text: draft.text });
+  else if (draft?.reply) beginReply(draft.reply, state.messageCache.get(Number(draft.reply.id))?.body);
+  autosizeComposer();
   state.threadRoot = null;
   ui.emptyChat.classList.add("hidden");
   ui.activeChat.classList.remove("hidden");
@@ -532,28 +614,42 @@ async function openConversation(id) {
 async function loadMessages() {
   const conversation = state.activeConversation;
   if (!conversation) return;
-  ui.messageList.replaceChildren();
-  state.messageCache.clear();
-
+  const view = state.messageView;
+  const epoch = view.epoch;
+  const request = ++view.request;
+  const writes = new Map(view.writes);
+  const current = () => state.activeConversation?.id === conversation.id && view.epoch === epoch && view.request === request;
+  const follow = nearMessageBottom(ui.messageList);
   try {
     const roomKey = await unlockConversationKey(conversation);
     const result = await api(`/api/conversations/${conversation.id}/messages?limit=50`);
+    if (!current()) return;
     for (const message of result.messages || []) {
-      await appendMessage(message, roomKey);
+      const valid = () => current() && view.writes.get(String(message.id)) === writes.get(String(message.id));
+      await appendMessage(message, roomKey, ui.messageList, false, valid);
     }
-    const last = result.messages?.[result.messages.length - 1];
-    if (last) await markConversationRead(last.id);
-    requestAnimationFrame(() => {
+    if (!current()) return;
+    if (follow) {
       ui.messageList.scrollTop = ui.messageList.scrollHeight;
-    });
+      markVisibleMessagesRead();
+    }
   } catch {
-    showToast(t("cryptoError"));
+    if (current()) showToast(t("serverError"));
   }
 }
 
-async function appendMessage(message, roomKey = null, host = ui.messageList, isThread = false) {
-  const conversation = state.conversations.find(c => c.id === message.conversation_id) || state.activeConversation;
+async function appendMessage(message, roomKey = null, host = ui.messageList, isThread = false, valid = null) {
+  const conversation = state.conversations.find(c => c.id === message.conversation_id);
   if (!conversation) return;
+  const view = isThread ? state.threadView : state.messageView;
+  const epoch = view.epoch;
+  const id = String(message.id);
+  const revision = valid ? null : (view.writes.get(id) || 0) + 1;
+  if (!valid) view.writes.set(id, revision);
+  const current = () => state.me && state.activeConversation?.id === conversation.id && view.epoch === epoch
+    && (valid ? valid() : view.writes.get(id) === revision)
+    && (isThread ? String(state.threadRoot?.id) === String(message.thread_root_id) : !message.thread_root_id);
+  if (!current()) return;
   roomKey ||= await unlockConversationKey(conversation);
 
   let body = { text: "" };
@@ -564,6 +660,7 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
       body = { text: "🔒 " + t("encrypted") };
     }
   }
+  if (!current()) return;
   state.messageCache.set(Number(message.id), { message, body });
 
   const row = document.createElement("div");
@@ -712,11 +809,24 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
     const peer = directPeer(conversation);
     receipt = Number(peer?.lastReadMessageId || 0) >= Number(message.id) ? " ✓✓" : " ✓";
   }
-  meta.textContent = `${message.pinned ? "📌 " : ""}${message.edited_at ? t("edited") + " · " : ""}${shortTime(message.created_at)}${receipt}`;
+  meta.textContent = `${message.pinned ? "📌 " : ""}${message.edited_at ? t("edited") + " · " : ""}${shortTime(message.created_at)}`;
+  if (receipt) {
+    const status = document.createElement("span");
+    status.className = "message-receipt";
+    status.textContent = receipt;
+    meta.appendChild(status);
+  }
   bubble.appendChild(meta);
 
   row.appendChild(bubble);
-  host.appendChild(row);
+  // Check after decryption, then commit synchronously. Concurrent history and
+  // WebSocket deliveries therefore share one row, even if decryption finishes out of order.
+  const existing = host.querySelector(`[data-message-id="${message.id}"]`);
+  if (existing) existing.replaceWith(row);
+  else {
+    const next = Array.from(host.children).find(item => Number(item.dataset.messageId) > Number(message.id));
+    host.insertBefore(row, next || null);
+  }
 }
 
 async function renderAttachment(host, attachment, roomKey) {
@@ -835,32 +945,64 @@ async function togglePin(messageId) {
 
 async function sendText() {
   const conversation = state.activeConversation;
-  const text = ui.messageInput.value.trim();
-  if (!conversation || !text || !canPostToConversation(conversation)) return;
-
-  const roomKey = await unlockConversationKey(conversation);
-  const encrypted = await encryptJson(roomKey, { version: 1, text });
-
-  if (state.editingMessage) {
-    await api(`/api/conversations/${conversation.id}/messages/${state.editingMessage.id}`, {
-      method: "PATCH",
-      body: JSON.stringify(encrypted)
-    });
-  } else {
-    await api(`/api/conversations/${conversation.id}/messages`, {
-      method: "POST",
-      body: JSON.stringify({
-        ...encrypted,
-        replyToId: state.replyTo?.id || null
-      })
-    });
+  const draft = ui.messageInput.value;
+  const text = draft.trim();
+  if (state.sendingText || !conversation || !text || !canPostToConversation(conversation)) return;
+  const editing = state.editingMessage;
+  const reply = state.replyTo;
+  state.sendingText = true;
+  ui.sendButton.disabled = true;
+  try {
+    const roomKey = await unlockConversationKey(conversation);
+    if (editing) {
+      const encrypted = await encryptJson(roomKey, { ...state.messageCache.get(Number(editing.id))?.body, version: 1, text });
+      await api(`/api/conversations/${conversation.id}/messages/${editing.id}`, {
+        method: "PATCH", body: JSON.stringify(encrypted)
+      });
+      if (state.activeConversation?.id === conversation.id) await loadMessages();
+    } else {
+      const result = await postTextMessage(conversation, roomKey, text, reply?.id || null);
+      await appendMessage(result.message, roomKey);
+    }
+    if (state.activeConversation?.id === conversation.id && ui.messageInput.value === draft
+        && state.editingMessage === editing && state.replyTo === reply) {
+      ui.messageInput.value = "";
+      autosizeComposer();
+      clearComposerContext();
+    }
+    const savedDraft = state.drafts.get(conversation.id);
+    if (savedDraft?.text === draft && savedDraft.reply === reply && savedDraft.editing === editing) {
+      state.drafts.delete(conversation.id);
+    }
+    if (state.activeConversation?.id === conversation.id) {
+      ui.messageList.scrollTop = ui.messageList.scrollHeight;
+      markVisibleMessagesRead();
+    }
+    await loadConversations();
+  } finally {
+    state.sendingText = false;
+    ui.sendButton.disabled = false;
   }
+}
 
-  ui.messageInput.value = "";
-  autosizeComposer();
-  clearComposerContext();
-  await loadMessages();
-  await loadConversations();
+async function postTextMessage(conversation, roomKey, text, replyToId, threadRootId = null) {
+  const key = `${conversation.id}:${threadRootId || "main"}`;
+  const signature = JSON.stringify([text, replyToId]);
+  let pending = state.pendingSends.get(key);
+  if (pending?.signature !== signature) {
+    pending = {
+      signature,
+      payload: { ...await encryptJson(roomKey, { version: 1, text }),
+        clientMessageId: crypto.randomUUID(), replyToId, threadRootId }
+    };
+    state.pendingSends.set(key, pending);
+  }
+  // Keep the same encrypted payload and id if the response is lost and the user retries.
+  const result = await api(`/api/conversations/${conversation.id}/messages`, {
+    method: "POST", body: JSON.stringify(pending.payload)
+  });
+  if (state.pendingSends.get(key) === pending) state.pendingSends.delete(key);
+  return result;
 }
 
 async function compressImage(file) {
@@ -886,6 +1028,7 @@ async function compressImage(file) {
 async function sendFile(file) {
   const conversation = state.activeConversation;
   if (!conversation || !file || !canPostToConversation(conversation)) return;
+  const reply = state.replyTo;
 
   let prepared = file;
   try {
@@ -919,15 +1062,18 @@ async function sendFile(file) {
     }
   };
   const encryptedMessage = await encryptJson(roomKey, body);
-  await api(`/api/conversations/${conversation.id}/messages`, {
+  const result = await api(`/api/conversations/${conversation.id}/messages`, {
     method: "POST",
     body: JSON.stringify({
       ...encryptedMessage,
+      clientMessageId: crypto.randomUUID(),
       attachmentId: upload.id,
-      replyToId: state.replyTo?.id || null
+      replyToId: reply?.id || null
     })
   });
-  clearComposerContext();
+  await appendMessage(result.message, roomKey);
+  if (state.activeConversation?.id === conversation.id && state.replyTo === reply) clearComposerContext();
+  await loadConversations();
 }
 
 function capturePendingInvite() {
@@ -1264,6 +1410,7 @@ async function leaveCurrentConversation() {
 async function openThread(message, body) {
   const conversation = state.activeConversation;
   if (!conversation || conversation.kind !== "channel" || conversation.comments_enabled === false) return;
+  resetMessageView(ui.threadMessageList, state.threadView);
   state.threadRoot = message;
   state.threadReplyTo = null;
   state.threadEditingMessage = null;
@@ -1277,148 +1424,189 @@ async function loadThreadMessages() {
   const conversation = state.activeConversation;
   const root = state.threadRoot;
   if (!conversation || !root) return;
+  const view = state.threadView;
+  const epoch = view.epoch;
+  const request = ++view.request;
+  const writes = new Map(view.writes);
+  const current = () => state.activeConversation?.id === conversation.id && state.threadRoot === root
+    && view.epoch === epoch && view.request === request;
+  const follow = nearMessageBottom(ui.threadMessageList);
   const roomKey = await unlockConversationKey(conversation);
   const result = await api(`/api/conversations/${conversation.id}/messages?threadRootId=${root.id}&limit=100`);
-  ui.threadMessageList.replaceChildren();
+  if (!current()) return;
   for (const message of result.messages || []) {
-    await appendMessage(message, roomKey, ui.threadMessageList, true);
+    const valid = () => current() && view.writes.get(String(message.id)) === writes.get(String(message.id));
+    await appendMessage(message, roomKey, ui.threadMessageList, true, valid);
   }
-  const last = result.messages?.[result.messages.length - 1];
-  if (last) await markConversationRead(last.id);
-  ui.threadMessageList.scrollTop = ui.threadMessageList.scrollHeight;
+  // Thread ids must not advance the channel's top-level read cursor.
+  if (current() && follow) ui.threadMessageList.scrollTop = ui.threadMessageList.scrollHeight;
 }
 
 async function sendThreadComment() {
   const conversation = state.activeConversation;
   const root = state.threadRoot;
-  const text = ui.threadInput.value.trim();
-  if (!conversation || !root || !text) return;
-
-  const roomKey = await unlockConversationKey(conversation);
-  const encrypted = await encryptJson(roomKey, { version: 1, text });
-  if (state.threadEditingMessage) {
-    await api(`/api/conversations/${conversation.id}/messages/${state.threadEditingMessage.id}`, {
-      method: "PATCH",
-      body: JSON.stringify(encrypted)
-    });
-  } else {
-    await api(`/api/conversations/${conversation.id}/messages`, {
-      method: "POST",
-      body: JSON.stringify({
-        ...encrypted,
-        threadRootId: root.id,
-        replyToId: state.threadReplyTo?.id || null
-      })
-    });
+  const draft = ui.threadInput.value;
+  const text = draft.trim();
+  if (state.sendingThread || !conversation || !root || !text) return;
+  const editing = state.threadEditingMessage;
+  const reply = state.threadReplyTo;
+  state.sendingThread = true;
+  ui.threadSendButton.disabled = true;
+  try {
+    const roomKey = await unlockConversationKey(conversation);
+    if (editing) {
+      const encrypted = await encryptJson(roomKey, { version: 1, text });
+      await api(`/api/conversations/${conversation.id}/messages/${editing.id}`, {
+        method: "PATCH", body: JSON.stringify(encrypted)
+      });
+      if (state.threadRoot === root) await loadThreadMessages();
+    } else {
+      const result = await postTextMessage(conversation, roomKey, text, reply?.id || null, root.id);
+      await appendMessage(result.message, roomKey, ui.threadMessageList, true);
+    }
+    if (state.threadRoot === root && ui.threadInput.value === draft
+        && state.threadEditingMessage === editing && state.threadReplyTo === reply) {
+      state.threadEditingMessage = null;
+      state.threadReplyTo = null;
+      ui.threadInput.value = "";
+      ui.threadSubtitle.textContent = state.messageCache.get(Number(root.id))?.body?.text?.slice(0, 100) || `#${root.id}`;
+    }
+    if (state.threadRoot === root) ui.threadMessageList.scrollTop = ui.threadMessageList.scrollHeight;
+    if (state.activeConversation?.id === conversation.id) await loadMessages();
+    await loadConversations();
+  } finally {
+    state.sendingThread = false;
+    ui.threadSendButton.disabled = false;
   }
-
-  state.threadEditingMessage = null;
-  state.threadReplyTo = null;
-  ui.threadInput.value = "";
-  ui.threadSubtitle.textContent = state.messageCache.get(Number(root.id))?.body?.text?.slice(0, 100) || `#${root.id}`;
-  await loadThreadMessages();
-  await loadMessages();
-  await loadConversations();
 }
 
 function connectSocket() {
+  clearTimeout(state.reconnectTimer);
+  if (!state.me) return;
   if (state.ws && state.ws.readyState <= 1) return;
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(`${protocol}//${location.host}/ws`);
   state.ws = ws;
 
+  ws.addEventListener("open", () => {
+    if (state.ws !== ws) return;
+    // HTTP acknowledgements cover sends; this covers messages missed while disconnected.
+    state.online.clear();
+    loadConversations().then(async () => {
+      if (state.ws !== ws) return;
+      await loadMessages();
+      if (state.threadRoot) await loadThreadMessages();
+    }).catch(() => showToast(t("serverError")));
+  });
+
   ws.addEventListener("message", async event => {
-    let message;
+    if (state.ws !== ws || !state.me) return;
     try {
-      message = JSON.parse(event.data);
-    } catch {
-      return;
-    }
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        return;
+      }
 
-    if (message.type === "presence") {
-      if (message.online) state.online.add(message.userId);
-      else state.online.delete(message.userId);
-      updateChatHeader();
-      renderConversationList();
-      return;
-    }
+      if (message.type === "presence") {
+        if (message.online) state.online.add(message.userId);
+        else state.online.delete(message.userId);
+        updateChatHeader();
+        renderConversationList();
+        return;
+      }
 
-    if (message.type === "message") {
-      const incoming = message.message;
-      const sourceConversation = state.conversations.find(c => c.id === incoming.conversation_id);
-      maybeNotifyIncoming(sourceConversation, incoming);
-      if (state.activeConversation?.id === incoming.conversation_id) {
-        const roomKey = await unlockConversationKey(state.activeConversation);
-        if (incoming.thread_root_id) {
-          if (state.threadRoot?.id === incoming.thread_root_id && !ui.threadModal.classList.contains("hidden")) {
-            await appendMessage(incoming, roomKey, ui.threadMessageList, true);
-            ui.threadMessageList.scrollTop = ui.threadMessageList.scrollHeight;
+      if (message.type === "message") {
+        const incoming = message.message;
+        if (!incoming?.id || state.seenMessages.has(String(incoming.id))) return;
+        state.seenMessages.add(String(incoming.id));
+        if (state.seenMessages.size > 2000) state.seenMessages.delete(state.seenMessages.values().next().value);
+        const sourceConversation = state.conversations.find(c => c.id === incoming.conversation_id);
+        maybeNotifyIncoming(sourceConversation, incoming);
+        if (state.activeConversation?.id === incoming.conversation_id) {
+          const roomKey = await unlockConversationKey(state.activeConversation);
+          if (state.activeConversation?.id !== incoming.conversation_id) return;
+          if (incoming.thread_root_id) {
+            if (String(state.threadRoot?.id) === String(incoming.thread_root_id) && !ui.threadModal.classList.contains("hidden")) {
+              const follow = nearMessageBottom(ui.threadMessageList);
+              await appendMessage(incoming, roomKey, ui.threadMessageList, true);
+              if (follow) ui.threadMessageList.scrollTop = ui.threadMessageList.scrollHeight;
+            }
+            await loadMessages();
+          } else {
+            const follow = nearMessageBottom(ui.messageList);
+            await appendMessage(incoming, roomKey);
+            if (follow) {
+              ui.messageList.scrollTop = ui.messageList.scrollHeight;
+              markVisibleMessagesRead();
+            }
           }
+        }
+        await loadConversations();
+        return;
+      }
+
+      if (message.type === "typing") {
+        if (state.activeConversation?.id === message.conversationId && message.userId !== state.me.id) {
+          clearTimeout(state.remoteTypingTimer);
+          ui.chatStatus.textContent = message.typing ? t("typing") : conversationStatus(state.activeConversation);
+          if (message.typing) {
+            state.remoteTypingTimer = setTimeout(() => updateChatHeader(), 2600);
+          }
+        }
+        return;
+      }
+
+      if (message.type === "read") {
+        const conversation = state.conversations.find(c => c.id === message.conversationId);
+        const member = conversation?.members?.find(item => item.id === message.userId);
+        if (member) member.lastReadMessageId = Math.max(Number(member.lastReadMessageId || 0), Number(message.messageId || 0));
+        if (conversation && message.userId === state.me.id) {
+          conversation.last_read_message_id = Math.max(Number(conversation.last_read_message_id || 0), Number(message.messageId || 0));
+          if (Number(message.messageId) >= Number(conversation.last_message_id || 0)) conversation.unread_count = 0;
+          renderConversationList();
+        }
+        if (state.activeConversation?.id === message.conversationId) updateReadReceipts();
+        return;
+      }
+
+      if (["message-updated", "message-deleted", "message-reactions", "message-pinned"].includes(message.type)) {
+        if (state.activeConversation?.id === message.conversationId || state.activeConversation?.id === message.message?.conversation_id) {
           await loadMessages();
-        } else {
-          await appendMessage(incoming, roomKey);
-          ui.messageList.scrollTop = ui.messageList.scrollHeight;
-          await markConversationRead(incoming.id);
+          if (state.threadRoot && !ui.threadModal.classList.contains("hidden")) await loadThreadMessages();
         }
+        await loadConversations();
+        return;
       }
-      await loadConversations();
-      return;
-    }
 
-    if (message.type === "typing") {
-      if (state.activeConversation?.id === message.conversationId && message.userId !== state.me.id) {
-        clearTimeout(state.remoteTypingTimer);
-        ui.chatStatus.textContent = message.typing ? t("typing") : conversationStatus(state.activeConversation);
-        if (message.typing) {
-          state.remoteTypingTimer = setTimeout(() => updateChatHeader(), 2600);
+      if (["conversation-created", "conversation-updated", "member-role", "member-removed"].includes(message.type)) {
+        await loadConversations();
+        updateChatHeader();
+        if (!ui.chatInfoModal.classList.contains("hidden")) await renderChatInfo();
+        return;
+      }
+
+      if (message.type === "conversation-removed") {
+        if (state.activeConversation?.id === message.conversationId) {
+          state.activeConversation = null;
+          ui.activeChat.classList.add("hidden");
+          ui.emptyChat.classList.remove("hidden");
+          ui.chatPane.classList.add("empty");
+          ui.appView.classList.remove("chat-open");
         }
+        await loadConversations();
+        return;
       }
-      return;
-    }
 
-    if (message.type === "read") {
-      const conversation = state.conversations.find(c => c.id === message.conversationId);
-      const member = conversation?.members?.find(item => item.id === message.userId);
-      if (member) member.lastReadMessageId = Math.max(Number(member.lastReadMessageId || 0), Number(message.messageId || 0));
-      if (state.activeConversation?.id === message.conversationId && state.activeConversation.kind === "direct") {
-        await loadMessages();
-      }
-      return;
+      await handleCallSignal(message);
+    } catch (error) {
+      console.error("M0D socket event failed", error);
     }
-
-    if (["message-updated", "message-deleted", "message-reactions", "message-pinned"].includes(message.type)) {
-      if (state.activeConversation?.id === message.conversationId || state.activeConversation?.id === message.message?.conversation_id) {
-        await loadMessages();
-        if (state.threadRoot && !ui.threadModal.classList.contains("hidden")) await loadThreadMessages();
-      }
-      await loadConversations();
-      return;
-    }
-
-    if (["conversation-created", "conversation-updated", "member-role", "member-removed"].includes(message.type)) {
-      await loadConversations();
-      updateChatHeader();
-      if (!ui.chatInfoModal.classList.contains("hidden")) await renderChatInfo();
-      return;
-    }
-
-    if (message.type === "conversation-removed") {
-      if (state.activeConversation?.id === message.conversationId) {
-        state.activeConversation = null;
-        ui.activeChat.classList.add("hidden");
-        ui.emptyChat.classList.remove("hidden");
-        ui.chatPane.classList.add("empty");
-        ui.appView.classList.remove("chat-open");
-      }
-      await loadConversations();
-      return;
-    }
-
-    await handleCallSignal(message);
   });
 
   ws.addEventListener("close", () => {
-    if (state.me) setTimeout(connectSocket, 1600);
+    if (state.ws === ws && state.me) state.reconnectTimer = setTimeout(connectSocket, 1600);
   });
 }
 
@@ -1884,6 +2072,10 @@ async function toggleSpeaker() {
 }
 
 async function logout() {
+  clearTimeout(state.reconnectTimer);
+  const socket = state.ws;
+  state.ws = null;
+  socket?.close();
   try {
     await api("/api/auth/logout", { method: "POST", body: "{}" });
   } catch {}
@@ -1922,7 +2114,7 @@ async function boot() {
   capturePendingInvite();
 
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/sw.js").catch(() => {});
+    navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch(() => {});
   }
 
   let result;
@@ -2014,6 +2206,7 @@ ui.cancelComposerContext.addEventListener("click", () => {
 });
 
 ui.closeThreadButton.addEventListener("click", () => {
+  resetMessageView(ui.threadMessageList, state.threadView);
   ui.threadModal.classList.add("hidden");
   state.threadRoot = null;
   state.threadReplyTo = null;
@@ -2025,7 +2218,7 @@ ui.threadModal.addEventListener("click", event => {
 ui.threadSendButton.addEventListener("click", () => sendThreadComment().catch(() => showToast(t("serverError"))));
 ui.threadInput.addEventListener("input", () => pulseTyping(state.threadRoot?.id || null));
 ui.threadInput.addEventListener("keydown", event => {
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && !event.repeat) {
     event.preventDefault();
     sendThreadComment().catch(() => showToast(t("serverError")));
   }
@@ -2036,12 +2229,20 @@ ui.messageInput.addEventListener("input", () => {
   pulseTyping();
 });
 ui.messageInput.addEventListener("keydown", event => {
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && !event.repeat) {
     event.preventDefault();
     sendText().catch(() => showToast(t("serverError")));
   }
 });
 ui.sendButton.addEventListener("click", () => sendText().catch(() => showToast(t("serverError"))));
+ui.messageList.addEventListener("scroll", markVisibleMessagesRead, { passive: true });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.me) {
+    connectSocket();
+    markVisibleMessagesRead();
+  }
+});
+window.addEventListener("online", connectSocket);
 ui.attachButton.addEventListener("click", () => ui.fileInput.click());
 ui.fileInput.addEventListener("change", async () => {
   const file = ui.fileInput.files?.[0];
