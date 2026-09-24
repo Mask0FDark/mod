@@ -1235,6 +1235,19 @@ async function initNativeShell() {
   if (!cap?.isNativePlatform?.()) return;
   document.documentElement.classList.add("native-app");
   const App = cap.Plugins?.App;
+  const StatusBar = cap.Plugins?.StatusBar;
+  const syncViewport = () => {
+    const height = Math.round(window.visualViewport?.height || window.innerHeight);
+    document.documentElement.style.setProperty("--native-app-height", `${height}px`);
+  };
+  syncViewport();
+  window.visualViewport?.addEventListener("resize", syncViewport);
+  window.addEventListener("orientationchange", syncViewport);
+  try {
+    await StatusBar?.setOverlaysWebView?.({ overlay: false });
+    await StatusBar?.setStyle?.({ style: "DARK" });
+    await StatusBar?.setBackgroundColor?.({ color: "#0e1621" });
+  } catch {}
   if (!App) return;
 
   await App.addListener?.("appUrlOpen", event => applyNativeUrl(event?.url || ""));
