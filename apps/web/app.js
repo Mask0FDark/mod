@@ -140,6 +140,7 @@ const state = {
   conversationRequest: 0,
   conversationLoad: null,
   routeRequest: 0,
+  userSearchRequest: 0,
   readRequests: new Map(),
   sendingText: false,
   sendingThread: false,
@@ -427,16 +428,9 @@ async function previewFor(conversation) {
 
 async function renderConversationList() {
   const query = ui.chatSearch.value.trim().toLowerCase();
+  const request = ++state.userSearchRequest;
   const list = state.conversations.filter(c => (conversationName(c)+" "+c.members.map(m=>m.username?"@"+m.username:"").join(" ")).toLowerCase().includes(query));
   ui.chatList.replaceChildren();
-
-  if (!list.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty-list";
-    empty.innerHTML = `<div><strong>${t("noChats")}</strong><p>${t("noChatsHint")}</p></div>`;
-    ui.chatList.appendChild(empty);
-    return;
-  }
 
   for (const conversation of list) {
     const row = document.createElement("button");
@@ -468,6 +462,51 @@ async function renderConversationList() {
       const preview = main.querySelector(".chat-preview");
       if (preview) preview.textContent = text;
     });
+  }
+
+  let globalResult = false;
+  const usernameMatch = query.match(/^@([a-z][a-z0-9_]{3,31})$/);
+  const directAlreadyShown = usernameMatch && list.some(c =>
+    c.kind === "direct" && directPeer(c)?.username?.toLowerCase() === usernameMatch[1]
+  );
+  if (usernameMatch && !directAlreadyShown) {
+    try {
+      const info = await api(`/api/users/by-username/${encodeURIComponent(usernameMatch[1])}`);
+      if (request !== state.userSearchRequest || ui.chatSearch.value.trim().toLowerCase() !== query) return;
+      const user = info.user;
+      const row = document.createElement("button");
+      row.className = "chat-row global-user-result";
+      row.type = "button";
+      const avatar = document.createElement("div");
+      avatar.className = "avatar";
+      paintAvatar(avatar,user,user.display_name);
+      const main = document.createElement("div");
+      main.className = "chat-row-main";
+      const top = document.createElement("div");
+      top.className = "chat-row-top";
+      const name = document.createElement("span");
+      name.className = "chat-row-name";
+      name.textContent = user.id === state.me.id ? `${user.display_name} · ${t("you")}` : user.display_name;
+      const preview = document.createElement("div");
+      preview.className = "chat-preview";
+      preview.textContent = "@"+user.username;
+      top.append(name);
+      main.append(top,preview);
+      row.append(avatar,main);
+      row.addEventListener("click",()=>{ location.hash="@"+user.username; });
+      ui.chatList.appendChild(row);
+      globalResult = true;
+    } catch (error) {
+      if (request !== state.userSearchRequest) return;
+      if (error?.status !== 404 && error?.status !== 400) throw error;
+    }
+  }
+
+  if (!list.length && !globalResult && request === state.userSearchRequest) {
+    const empty = document.createElement("div");
+    empty.className = "empty-list";
+    empty.innerHTML = `<div><strong>${t("noChats")}</strong><p>${t("noChatsHint")}</p></div>`;
+    ui.chatList.appendChild(empty);
   }
 }
 
