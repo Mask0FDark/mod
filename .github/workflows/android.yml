@@ -1,0 +1,47 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/privacy-invites-domain-config
+    paths:
+      - "apps/mobile/**"
+      - "apps/web/**"
+      - ".github/workflows/android.yml"
+
+jobs:
+  debug-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 36
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+      - name: Install mobile dependencies
+        run: npm ci
+        working-directory: apps/mobile
+      - name: Sync Capacitor
+        run: npx cap sync android
+        working-directory: apps/mobile
+        env:
+          M0D_APP_URL: https://m0d-dev.mask-0f-darkness.ru
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+        working-directory: apps/mobile/android
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: m0d-android-debug
+          path: apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

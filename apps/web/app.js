@@ -1217,6 +1217,46 @@ function scheduleChatRoute() {
   });
 }
 
+function applyNativeUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    let hash = url.hash || "";
+    if (url.protocol === "m0d:") {
+      const target = decodeURIComponent(url.pathname.replace(/^\//, ""));
+      if (url.hostname === "user" && target) hash = "#@" + target.replace(/^@/, "");
+      if (url.hostname === "chat" && /^\d+$/.test(target)) hash = "#" + target;
+    }
+    if (hash && location.hash !== hash) location.hash = hash;
+  } catch {}
+}
+
+async function initNativeShell() {
+  const cap = window.Capacitor;
+  if (!cap?.isNativePlatform?.()) return;
+  document.documentElement.classList.add("native-app");
+  const App = cap.Plugins?.App;
+  if (!App) return;
+
+  await App.addListener?.("appUrlOpen", event => applyNativeUrl(event?.url || ""));
+  await App.addListener?.("backButton", () => {
+    const viewer = document.querySelector(".media-viewer");
+    if (viewer) return viewer.remove();
+    const profile = document.querySelector(".profile-modal");
+    if (profile) return profile.querySelector(".profile-close")?.click();
+    if (!ui.chatInfoModal.classList.contains("hidden")) return ui.closeChatInfoButton.click();
+    if (!ui.threadModal.classList.contains("hidden")) return ui.closeThreadButton.click();
+    if (!ui.newChatModal.classList.contains("hidden")) return ui.closeNewChatButton.click();
+    if (!ui.callOverlay.classList.contains("hidden")) return ui.minimizeCallButton.click();
+    if (state.activeConversation || ui.appView.classList.contains("chat-open")) return ui.backButton.click();
+    App.minimizeApp?.();
+  });
+
+  try {
+    const launch = await App.getLaunchUrl?.();
+    if (launch?.url) applyNativeUrl(launch.url);
+  } catch {}
+}
+
 function capturePendingInvite() {
   const match = location.pathname.match(/^\/invite\/([A-Za-z0-9_-]+)\/?$/);
   const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
@@ -2510,6 +2550,7 @@ ui.meAvatar.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" ")openP
 const profileButton=document.createElement("button");profileButton.className="settings-action";profileButton.textContent=bt("profile");profileButton.onclick=openProfile;
 ui.settingsDrawer.querySelector(".drawer-section").prepend(profileButton);
 
+initNativeShell().catch(() => {});
 boot().catch(() => {
   ui.authView.classList.remove("hidden");
   ui.authError.textContent = t("serverError");
