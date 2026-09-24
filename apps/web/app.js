@@ -1130,11 +1130,29 @@ async function openUsernameChat(username, { syncUrl = false } = {}) {
   return openConversation(created.conversationId, { syncUrl });
 }
 
+function closeActiveConversationFromRoute() {
+  if (state.activeConversation) {
+    state.drafts.set(state.activeConversation.id, { text: ui.messageInput.value, reply: state.replyTo, editing: state.editingMessage });
+  }
+  state.activeConversation = null;
+  resetMessageView(ui.messageList, state.messageView);
+  resetMessageView(ui.threadMessageList, state.threadView);
+  state.messageCache.clear();
+  ui.activeChat.classList.add("hidden");
+  ui.emptyChat.classList.remove("hidden");
+  ui.chatPane.classList.add("empty");
+  ui.appView.classList.remove("chat-open");
+  renderConversationList();
+}
+
 async function handleChatRoute() {
   if (!state.me || state.pendingInvite) return;
   const request = ++state.routeRequest;
   const route = parseChatRoute();
-  if (!route) return;
+  if (!route) {
+    closeActiveConversationFromRoute();
+    return;
+  }
   try {
     if (route.type === "username") {
       await openUsernameChat(route.username, { syncUrl: false });
@@ -2286,7 +2304,13 @@ ui.chatSearch.addEventListener("keydown", event => {
     location.hash = value;
   }
 });
-ui.backButton.addEventListener("click", () => ui.appView.classList.remove("chat-open"));
+ui.backButton.addEventListener("click", () => {
+  if (location.hash && history.state?.conversation) history.back();
+  else {
+    history.replaceState(null, "", "/");
+    scheduleChatRoute();
+  }
+});
 ui.chatInfoButton.addEventListener("click", () => openChatInfo().catch(() => showToast(t("serverError"))));
 ui.closeChatInfoButton.addEventListener("click", () => ui.chatInfoModal.classList.add("hidden"));
 ui.chatInfoModal.addEventListener("click", event => {
