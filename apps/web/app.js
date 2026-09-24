@@ -32,6 +32,16 @@ const ui = {
   sidebar: $("sidebar"),
   menuButton: $("menuButton"),
   newChatButton: $("newChatButton"),
+  mobileSearchButton: $("mobileSearchButton"),
+  mobileChatFilters: $("mobileChatFilters"),
+  mobileBottomNav: $("mobileBottomNav"),
+  mobileProfileTab: $("mobileProfileTab"),
+  mobileCallsTab: $("mobileCallsTab"),
+  mobileChatsTab: $("mobileChatsTab"),
+  mobileSettingsTab: $("mobileSettingsTab"),
+  mobileCallsView: $("mobileCallsView"),
+  mobileCallsList: $("mobileCallsList"),
+  closeMobileCallsButton: $("closeMobileCallsButton"),
   chatSearch: $("chatSearch"),
   chatList: $("chatList"),
   meAvatar: $("meAvatar"),
@@ -121,6 +131,7 @@ const state = {
   authMode: "login",
   verificationId: null,
   pendingInvite: null,
+  pendingNativeConversation: null,
   me: null,
   privateKey: null,
   conversations: [],
@@ -141,6 +152,7 @@ const state = {
   conversationLoad: null,
   routeRequest: 0,
   userSearchRequest: 0,
+  mobileChatFilter: "all",
   readRequests: new Map(),
   sendingText: false,
   sendingThread: false,
@@ -429,7 +441,11 @@ async function previewFor(conversation) {
 async function renderConversationList() {
   const query = ui.chatSearch.value.trim().toLowerCase();
   const request = ++state.userSearchRequest;
-  const list = state.conversations.filter(c => (conversationName(c)+" "+c.members.map(m=>m.username?"@"+m.username:"").join(" ")).toLowerCase().includes(query));
+  const list = state.conversations.filter(c => {
+    const matchesQuery = (conversationName(c)+" "+c.members.map(m=>m.username?"@"+m.username:"").join(" ")).toLowerCase().includes(query);
+    const matchesFilter = state.mobileChatFilter === "all" || c.kind === state.mobileChatFilter;
+    return matchesQuery && matchesFilter;
+  });
   ui.chatList.replaceChildren();
 
   for (const conversation of list) {
@@ -637,6 +653,9 @@ async function openConversation(id, { syncUrl = true } = {}) {
   ui.messageInput.value = "";
   clearTimeout(state.remoteTypingTimer);
   state.activeConversation = conversation;
+  closeMobileCalls();
+  closeDrawer();
+  setMobileNavActive(ui.mobileChatsTab);
   clearComposerContext();
   const draft = state.drafts.get(id);
   ui.messageInput.value = draft?.text || "";
@@ -1236,6 +1255,7 @@ async function initNativeShell() {
   document.documentElement.classList.add("native-app");
   const App = cap.Plugins?.App;
   const StatusBar = cap.Plugins?.StatusBar;
+  const LocalNotifications = cap.Plugins?.LocalNotifications;
   const syncViewport = () => {
     const height = Math.round(window.visualViewport?.height || window.innerHeight);
     document.documentElement.style.setProperty("--native-app-height", `${height}px`);
@@ -1251,11 +1271,26 @@ async function initNativeShell() {
   if (!App) return;
 
   await App.addListener?.("appUrlOpen", event => applyNativeUrl(event?.url || ""));
+  await LocalNotifications?.addListener?.("localNotificationActionPerformed", event => {
+    const conversationId = event?.notification?.extra?.conversationId;
+    if (!conversationId) return;
+    if (state.me) openConversation(conversationId).catch(() => {});
+    else state.pendingNativeConversation = conversationId;
+  });
   await App.addListener?.("backButton", () => {
     const viewer = document.querySelector(".media-viewer");
     if (viewer) return viewer.remove();
+    const crop = document.querySelector(".avatar-crop-modal");
+    if (crop) return crop.querySelector(".crop-cancel")?.click();
     const profile = document.querySelector(".profile-modal");
     if (profile) return profile.querySelector(".profile-close")?.click();
+    if (!ui.mobileCallsView?.classList.contains("hidden")) return openMobileChats();
+    if (!ui.settingsDrawer.classList.contains("hidden")) return openMobileChats();
+    if (ui.sidebar.classList.contains("search-open")) {
+      ui.sidebar.classList.remove("search-open");
+      ui.chatSearch.blur();
+      return;
+    }
     if (!ui.chatInfoModal.classList.contains("hidden")) return ui.closeChatInfoButton.click();
     if (!ui.threadModal.classList.contains("hidden")) return ui.closeThreadButton.click();
     if (!ui.newChatModal.classList.contains("hidden")) return ui.closeNewChatButton.click();
@@ -1567,6 +1602,24 @@ async function toggleChannelComments() {
 }
 
 async function requestBrowserNotifications() {
+  const local = window.Capacitor?.Plugins?.LocalNotifications;
+  if (local) {
+    let permission = await local.checkPermissions();
+    if (permission.display !== "granted") permission = await local.requestPermissions();
+    if (permission.display === "granted") {
+      await local.createChannel?.({
+        id: "messages",
+        name: "Сообщения",
+        description: "Сообщения и звонки M0D",
+        importance: 5,
+        visibility: 1,
+        vibration: true
+      }).catch(() => {});
+      ui.enableNotificationsButton.dataset.i18n = "notificationsEnabled";
+      applyTranslations();
+    }
+    return;
+  }
   if (!("Notification" in window)) return;
   const permission = await Notification.requestPermission();
   if (permission === "granted") {
@@ -1575,12 +1628,36 @@ async function requestBrowserNotifications() {
   }
 }
 
+async function showNativeNotification(title, body, conversationId, idSeed = Date.now()) {
+  const local = window.Capacitor?.Plugins?.LocalNotifications;
+  if (!local || !document.hidden) return false;
+  const permission = await local.checkPermissions().catch(() => ({ display: "denied" }));
+  if (permission.display !== "granted") return false;
+  const id = Math.max(1, Math.abs(Number(idSeed) || Date.now()) % 2147483000);
+  await local.schedule({
+    notifications: [{
+      id,
+      title,
+      body,
+      channelId: "messages",
+      smallIcon: "ic_stat_m0d",
+      extra: { conversationId }
+    }]
+  }).catch(() => {});
+  return true;
+}
+
 function maybeNotifyIncoming(conversation, message) {
   if (!conversation || message.sender_id === state.me.id || conversation.notifications_enabled === false) return;
-  if (!document.hidden || !("Notification" in window) || Notification.permission !== "granted") return;
+  if (!document.hidden) return;
+  if (window.Capacitor?.Plugins?.LocalNotifications) {
+    showNativeNotification(conversationName(conversation), t("newMessageNotification"), conversation.id, message.id).catch(() => {});
+    return;
+  }
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
   const notification = new Notification(conversationName(conversation), {
     body: t("newMessageNotification"),
-    icon: "/icon.svg",
+    icon: "/brand-app-icon.svg",
     tag: `m0d-${conversation.id}`
   });
   notification.onclick = () => {
@@ -1908,6 +1985,12 @@ async function handleCallSignal(message) {
 
     const conversation = state.conversations.find(c => c.id === message.conversationId);
     if (!conversation) return;
+    showNativeNotification(
+      conversationName(conversation),
+      message.video ? "Входящий видеозвонок" : "Входящий звонок",
+      conversation.id,
+      Date.now()
+    ).catch(() => {});
     state.call.state = "ringing";
     state.call.peerId = message.from;
     state.call.conversationId = message.conversationId;
@@ -2146,6 +2229,7 @@ function finishCall(notify = true) {
   closePeerOnly();
   clearInterval(state.call.timer);
   clearInterval(state.call.stats);
+  window.Capacitor?.Plugins?.AudioRoute?.reset?.().catch(() => {});
 
   if (state.call.localStream) {
     for (const track of state.call.localStream.getTracks()) track.stop();
@@ -2180,16 +2264,23 @@ function finishCall(notify = true) {
 function refreshCallButtons() {
   const audio = state.call.localStream?.getAudioTracks()[0];
   const video = state.call.localStream?.getVideoTracks()[0];
-  ui.micButton.classList.toggle("off", Boolean(audio && !audio.enabled));
+  const muted = Boolean(audio && !audio.enabled);
+  ui.micButton.classList.toggle("off", muted);
+  ui.micButton.textContent = muted ? "🔇" : "🎙";
+  ui.micButton.setAttribute("aria-pressed", String(muted));
   ui.cameraButton.classList.toggle("off", !video || !video.enabled);
-  ui.speakerButton.textContent = state.call.speaker ? "🔊" : "◉";
+  ui.speakerButton.textContent = state.call.speaker ? "🔊" : "◖";
   ui.speakerButton.title = state.call.speaker ? t("speaker") : t("earpiece");
+  ui.speakerButton.setAttribute("aria-pressed", String(state.call.speaker));
 }
 
-function toggleMic() {
+async function toggleMic() {
   const track = state.call.localStream?.getAudioTracks()[0];
   if (!track) return;
   track.enabled = !track.enabled;
+  const native = window.Capacitor?.Plugins?.AudioRoute;
+  await native?.setMicrophoneMuted?.({ muted: !track.enabled }).catch(() => {});
+  window.Capacitor?.Plugins?.Haptics?.impact?.({ style: "LIGHT" }).catch(() => {});
   refreshCallButtons();
 }
 
@@ -2236,8 +2327,9 @@ async function stopScreenShare(restore = false) {
 
 async function applyAudioRoute() {
   refreshCallButtons();
-  if (window.M0DNative?.setSpeakerphone) {
-    window.M0DNative.setSpeakerphone(Boolean(state.call.speaker));
+  const native = window.Capacitor?.Plugins?.AudioRoute;
+  if (native?.setSpeakerphone) {
+    await native.setSpeakerphone({ enabled: Boolean(state.call.speaker) }).catch(() => {});
     return;
   }
 
@@ -2261,7 +2353,7 @@ async function applyAudioRoute() {
 
 async function toggleSpeaker() {
   state.call.speaker = !state.call.speaker;
-  const hasNative = Boolean(window.M0DNative?.setSpeakerphone);
+  const hasNative = Boolean(window.Capacitor?.Plugins?.AudioRoute?.setSpeakerphone);
   const hasSink = typeof ui.remoteVideo.setSinkId === "function";
   if (!hasNative && !hasSink) {
     state.call.speaker = !state.call.speaker;
@@ -2281,6 +2373,85 @@ async function logout() {
   } catch {}
   if (state.me) await identityDelete(state.me.id);
   location.reload();
+}
+
+function setMobileNavActive(button) {
+  [ui.mobileProfileTab,ui.mobileCallsTab,ui.mobileChatsTab,ui.mobileSettingsTab].forEach(item => item?.classList.toggle("active", item === button));
+}
+
+function closeMobileCalls() {
+  ui.mobileCallsView?.classList.add("hidden");
+}
+
+function openMobileChats() {
+  closeDrawer();
+  closeMobileCalls();
+  document.querySelectorAll(".profile-modal").forEach(node => node.remove());
+  setMobileNavActive(ui.mobileChatsTab);
+  if (ui.appView.classList.contains("chat-open")) ui.backButton.click();
+}
+
+async function openMobileCalls() {
+  closeDrawer();
+  document.querySelectorAll(".profile-modal").forEach(node => node.remove());
+  setMobileNavActive(ui.mobileCallsTab);
+  ui.mobileCallsView.classList.remove("hidden");
+  ui.mobileCallsList.innerHTML = '<div class="mobile-call-empty">Загрузка…</div>';
+  try {
+    const result = await api("/api/calls");
+    ui.mobileCallsList.replaceChildren();
+    if (!result.calls?.length) {
+      const empty = document.createElement("div");
+      empty.className = "mobile-call-empty";
+      empty.textContent = "Звонков пока нет";
+      ui.mobileCallsList.append(empty);
+      return;
+    }
+    for (const call of result.calls) {
+      const row = document.createElement("button");
+      row.className = "mobile-call-row";
+      row.type = "button";
+      const avatar = document.createElement("div");
+      avatar.className = "avatar";
+      paintAvatar(avatar,{id:call.peer_id,display_name:call.peer_name,avatar_version:call.peer_avatar_version},call.peer_name);
+      const main = document.createElement("div");
+      main.className = "mobile-call-main";
+      const title = document.createElement("strong");
+      title.textContent = call.peer_name || call.peer_username || "Пользователь";
+      const detail = document.createElement("span");
+      const direction = call.direction === "outgoing" ? "Исходящий" : "Входящий";
+      const type = call.video ? "видеозвонок" : "звонок";
+      const duration = Number(call.duration || 0);
+      detail.textContent = `${direction} ${type}${duration ? " · " + Math.floor(duration/60) + ":" + String(duration%60).padStart(2,"0") : ""}`;
+      main.append(title,detail);
+      const meta = document.createElement("span");
+      meta.className = "mobile-call-meta";
+      meta.textContent = shortTime(call.created_at);
+      row.append(avatar,main,meta);
+      row.onclick = () => {
+        closeMobileCalls();
+        setMobileNavActive(ui.mobileChatsTab);
+        openConversation(call.conversation_id).catch(() => {});
+      };
+      ui.mobileCallsList.append(row);
+    }
+  } catch {
+    ui.mobileCallsList.innerHTML = '<div class="mobile-call-empty">Не удалось загрузить историю звонков</div>';
+  }
+}
+
+function openMobileSettings() {
+  closeMobileCalls();
+  document.querySelectorAll(".profile-modal").forEach(node => node.remove());
+  setMobileNavActive(ui.mobileSettingsTab);
+  openDrawer();
+}
+
+function openMobileProfile() {
+  closeMobileCalls();
+  closeDrawer();
+  setMobileNavActive(ui.mobileProfileTab);
+  openProfile();
 }
 
 function openDrawer() {
@@ -2306,7 +2477,14 @@ async function enterMessenger() {
   state.roomKeys.clear();
   await loadConversations();
   connectSocket();
-  if (state.pendingInvite) await acceptPendingInvite();
+  if (document.documentElement.classList.contains("native-app")) {
+    requestBrowserNotifications().catch(() => {});
+  }
+  if (state.pendingNativeConversation) {
+    const conversationId = state.pendingNativeConversation;
+    state.pendingNativeConversation = null;
+    await openConversation(conversationId).catch(() => {});
+  } else if (state.pendingInvite) await acceptPendingInvite();
   else await handleChatRoute();
 }
 
@@ -2376,7 +2554,19 @@ ui.newChatModal.addEventListener("click", event => {
 });
 
 ui.menuButton.addEventListener("click", openDrawer);
-ui.closeDrawerButton.addEventListener("click", closeDrawer);
+ui.mobileProfileTab?.addEventListener("click", openMobileProfile);
+ui.mobileCallsTab?.addEventListener("click", () => openMobileCalls().catch(() => {}));
+ui.mobileChatsTab?.addEventListener("click", openMobileChats);
+ui.mobileSettingsTab?.addEventListener("click", openMobileSettings);
+ui.closeMobileCallsButton?.addEventListener("click", openMobileChats);
+ui.mobileSearchButton?.addEventListener("click", () => {
+  ui.sidebar.classList.toggle("search-open");
+  if (ui.sidebar.classList.contains("search-open")) setTimeout(() => ui.chatSearch.focus(), 30);
+});
+ui.closeDrawerButton.addEventListener("click", () => {
+  closeDrawer();
+  if (document.documentElement.classList.contains("native-app")) setMobileNavActive(ui.mobileChatsTab);
+});
 ui.drawerBackdrop.addEventListener("click", closeDrawer);
 ui.enableNotificationsButton.addEventListener("click", () => requestBrowserNotifications().catch(() => {}));
 ui.logoutButton.addEventListener("click", logout);
@@ -2384,6 +2574,13 @@ ui.logoutButton.addEventListener("click", logout);
 ui.muteConversationButton.addEventListener("click", () => toggleConversationNotifications().catch(() => showToast(t("serverError"))));
 ui.toggleCommentsButton.addEventListener("click", () => toggleChannelComments().catch(() => showToast(t("serverError"))));
 
+ui.mobileChatFilters?.addEventListener("click", event => {
+  const button = event.target.closest(".mobile-chat-filter");
+  if (!button) return;
+  state.mobileChatFilter = button.dataset.filter || "all";
+  ui.mobileChatFilters.querySelectorAll(".mobile-chat-filter").forEach(item => item.classList.toggle("active", item === button));
+  renderConversationList().catch(() => {});
+});
 ui.chatSearch.addEventListener("input", renderConversationList);
 ui.chatSearch.addEventListener("keydown", event => {
   if (event.key !== "Enter") return;
@@ -2516,6 +2713,84 @@ function callText(event){
   const duration=event.duration? ` · ${Math.floor(event.duration/60)}:${String(event.duration%60).padStart(2,"0")}`:"";
   return (event.video?"◉ ":"☎ ")+bt(event.video?"video":"audio")+" · "+bt(event.status)+duration;
 }
+async function chooseAvatarCrop(file) {
+  if (!file || !file.type.startsWith("image/")) throw new Error("invalid_avatar");
+  const sourceUrl = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    image.src = sourceUrl;
+    await image.decode();
+
+    return await new Promise(resolve => {
+      const modal = document.createElement("div");
+      modal.className = "modal avatar-crop-modal";
+      modal.innerHTML = `<div class="avatar-crop-card">
+        <header><div><h2>Фото профиля</h2><p>Перетащи фото и выбери масштаб</p></div><button type="button" class="round-icon crop-cancel">✕</button></header>
+        <div class="avatar-crop-stage"><img alt=""></div>
+        <label class="avatar-zoom"><span>Масштаб</span><input type="range" min="1" max="3" step="0.01" value="1"></label>
+        <div class="avatar-crop-actions"><button type="button" class="secondary-button crop-cancel">Отмена</button><button type="button" class="primary-button crop-save">Выбрать</button></div>
+      </div>`;
+      document.body.append(modal);
+      const stage = modal.querySelector(".avatar-crop-stage");
+      const preview = stage.querySelector("img");
+      const slider = modal.querySelector("input[type=range]");
+      preview.src = sourceUrl;
+      let zoom = 1, offsetX = 0, offsetY = 0, dragging = false, lastX = 0, lastY = 0;
+
+      const metrics = () => {
+        const size = stage.clientWidth;
+        const base = Math.max(size / image.naturalWidth, size / image.naturalHeight);
+        const scale = base * zoom;
+        return { size, scale, width: image.naturalWidth * scale, height: image.naturalHeight * scale };
+      };
+      const clamp = () => {
+        const m = metrics();
+        const maxX = Math.max(0, (m.width - m.size) / 2);
+        const maxY = Math.max(0, (m.height - m.size) / 2);
+        offsetX = Math.max(-maxX, Math.min(maxX, offsetX));
+        offsetY = Math.max(-maxY, Math.min(maxY, offsetY));
+      };
+      const paint = () => {
+        clamp();
+        const m = metrics();
+        preview.style.width = m.width + "px";
+        preview.style.height = m.height + "px";
+        preview.style.left = (m.size / 2 - m.width / 2 + offsetX) + "px";
+        preview.style.top = (m.size / 2 - m.height / 2 + offsetY) + "px";
+      };
+      const close = value => { modal.remove(); resolve(value); };
+      modal.querySelectorAll(".crop-cancel").forEach(button => button.onclick = () => close(null));
+      slider.oninput = () => { zoom = Number(slider.value); paint(); };
+      stage.onpointerdown = event => {
+        dragging = true; lastX = event.clientX; lastY = event.clientY;
+        stage.setPointerCapture(event.pointerId);
+      };
+      stage.onpointermove = event => {
+        if (!dragging) return;
+        offsetX += event.clientX - lastX; offsetY += event.clientY - lastY;
+        lastX = event.clientX; lastY = event.clientY; paint();
+      };
+      stage.onpointerup = stage.onpointercancel = () => { dragging = false; };
+      modal.querySelector(".crop-save").onclick = async () => {
+        const m = metrics();
+        const left = m.size / 2 - m.width / 2 + offsetX;
+        const top = m.size / 2 - m.height / 2 + offsetY;
+        const sx = Math.max(0, -left / m.scale);
+        const sy = Math.max(0, -top / m.scale);
+        const sourceSize = Math.min(image.naturalWidth - sx, image.naturalHeight - sy, m.size / m.scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = 512;
+        canvas.getContext("2d").drawImage(image, sx, sy, sourceSize, sourceSize, 0, 0, 512, 512);
+        const blob = await new Promise(done => canvas.toBlob(done, "image/png"));
+        close(blob);
+      };
+      requestAnimationFrame(paint);
+    });
+  } finally {
+    URL.revokeObjectURL(sourceUrl);
+  }
+}
+
 function openProfile(){
   closeDrawer();
   document.querySelectorAll(".profile-modal").forEach(node=>node.remove());
@@ -2527,7 +2802,7 @@ function openProfile(){
   form.querySelector(".profile-username").value=state.me.username||"";
   paintAvatar(form.querySelector(".profile-preview"),state.me);
   let avatar=null,remove=false,previewUrl=null,busy=false;
-  const close=()=>{if(busy)return;if(previewUrl)URL.revokeObjectURL(previewUrl);modal.remove();};
+  const close=()=>{if(busy)return;if(previewUrl)URL.revokeObjectURL(previewUrl);modal.remove();if(document.documentElement.classList.contains("native-app"))setMobileNavActive(ui.mobileChatsTab);};
   form.querySelector(".profile-close").onclick=close;
   modal.onclick=e=>{if(e.target===modal)close();};
   const input=form.querySelector(".avatar-input");
@@ -2537,9 +2812,10 @@ function openProfile(){
     try{
       const file=input.files[0];if(!file)return;
       if(file.size>20*1024*1024)throw new Error("invalid_avatar");
-      const bitmap=await createImageBitmap(file);const canvas=document.createElement("canvas");canvas.width=canvas.height=256;
-      const side=Math.min(bitmap.width,bitmap.height);canvas.getContext("2d").drawImage(bitmap,(bitmap.width-side)/2,(bitmap.height-side)/2,side,side,0,0,256,256);bitmap.close();
-      avatar=await new Promise(r=>canvas.toBlob(r,"image/png"));if(!avatar)throw new Error("invalid_avatar");
+      const cropped=await chooseAvatarCrop(file);
+      input.value="";
+      if(!cropped)return;
+      avatar=cropped;
       remove=false;if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=URL.createObjectURL(avatar);
       const img=document.createElement("img");img.src=previewUrl;img.alt="";form.querySelector(".profile-preview").replaceChildren(img);
     }catch(e){form.querySelector(".profile-error").textContent=bt("invalid_avatar");}
@@ -2562,6 +2838,31 @@ ui.meAvatar.addEventListener("click",openProfile);
 ui.meAvatar.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" ")openProfile();});
 const profileButton=document.createElement("button");profileButton.className="settings-action";profileButton.textContent=bt("profile");profileButton.onclick=openProfile;
 ui.settingsDrawer.querySelector(".drawer-section").prepend(profileButton);
+
+const clearCacheButton=document.createElement("button");
+clearCacheButton.className="settings-action";
+clearCacheButton.type="button";
+clearCacheButton.textContent="Очистить кэш";
+clearCacheButton.onclick=async()=>{
+  if("caches" in window){
+    const keys=await caches.keys();
+    await Promise.all(keys.map(key=>caches.delete(key)));
+  }
+  showToast("Кэш очищен");
+};
+ui.settingsDrawer.querySelector(".drawer-section").append(clearCacheButton);
+
+const settingsLogoutButton=document.createElement("button");
+settingsLogoutButton.className="settings-action settings-danger";
+settingsLogoutButton.type="button";
+settingsLogoutButton.textContent="Выйти из аккаунта";
+settingsLogoutButton.onclick=logout;
+ui.settingsDrawer.querySelector(".drawer-section").append(settingsLogoutButton);
+
+const versionNote=document.createElement("div");
+versionNote.className="settings-version";
+versionNote.textContent="M0D Android · 0.2.0 dev";
+ui.settingsDrawer.append(versionNote);
 
 initNativeShell().catch(() => {});
 boot().catch(() => {

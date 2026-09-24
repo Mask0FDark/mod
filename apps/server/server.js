@@ -408,6 +408,27 @@ app.get("/api/me", auth, (req, res) => {
   res.json({ user: req.user });
 });
 
+app.get("/api/calls", auth, async (req, res, next) => {
+  try {
+    const result = await db.query(
+      `SELECT ch.id,ch.conversation_id,ch.video,ch.status,ch.created_at,ch.accepted_at,ch.ended_at,
+              CASE WHEN ch.caller_id=$1 THEN 'outgoing' ELSE 'incoming' END AS direction,
+              peer.id AS peer_id,peer.display_name AS peer_name,peer.username AS peer_username,peer.avatar_version AS peer_avatar_version,
+              CASE WHEN ch.accepted_at IS NULL THEN 0
+                   ELSE GREATEST(0,EXTRACT(EPOCH FROM (COALESCE(ch.ended_at,now())-ch.accepted_at)))::int END AS duration
+         FROM call_history ch
+         JOIN users peer ON peer.id=CASE WHEN ch.caller_id=$1 THEN ch.callee_id ELSE ch.caller_id END
+        WHERE ch.caller_id=$1 OR ch.callee_id=$1
+        ORDER BY ch.created_at DESC
+        LIMIT 100`,
+      [req.user.id]
+    );
+    res.json({ calls: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.post("/api/conversations", auth, async (req, res, next) => {
   const client = await db.connect();
   try {
