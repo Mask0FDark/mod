@@ -426,7 +426,7 @@ app.post("/api/conversations", auth, async (req, res, next) => {
     const created = await client.query(
       `INSERT INTO conversations(kind,title,description,comments_enabled,created_by)
        VALUES($1,$2,$3,$4,$5)
-       RETURNING id,kind,title,description,comments_enabled,created_by,created_at`,
+       RETURNING id,public_id,kind,title,description,comments_enabled,created_by,created_at`,
       [kind, title, description || null, commentsEnabled, req.user.id]
     );
     const conversation = created.rows[0];
@@ -591,7 +591,7 @@ app.post("/api/invites/:token/accept", auth, async (req, res, next) => {
 app.get("/api/conversations", auth, async (req, res, next) => {
   try {
     const result = await db.query(
-      `SELECT c.id,c.kind,c.title,c.description,c.comments_enabled,c.created_by,c.created_at,
+      `SELECT c.id,c.public_id,c.kind,c.title,c.description,c.comments_enabled,c.created_by,c.created_at,
               mine.role AS my_role,mine.last_read_message_id,mine.notifications_enabled,
               ck.iv AS key_iv,ck.ciphertext AS key_ciphertext,ck.wrapped_by_user_id,
               COALESCE(json_agg(json_build_object(
@@ -664,7 +664,7 @@ app.patch("/api/conversations/:id", auth, async (req, res, next) => {
            description=CASE WHEN $3::boolean THEN $4 ELSE description END,
            comments_enabled=COALESCE($5,comments_enabled)
        WHERE id=$1
-       RETURNING id,kind,title,description,comments_enabled,created_by,created_at`,
+       RETURNING id,public_id,kind,title,description,comments_enabled,created_by,created_at`,
       [
         conversationId,
         title === undefined ? null : title,

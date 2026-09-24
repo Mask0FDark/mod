@@ -139,6 +139,7 @@ const state = {
   threadView: { epoch: 0, request: 0, writes: new Map() },
   conversationRequest: 0,
   conversationLoad: null,
+  routeRequest: 0,
   readRequests: new Map(),
   sendingText: false,
   sendingThread: false,
@@ -508,8 +509,9 @@ function updateChatHeader() {
   const name = conversationName(conversation);
   paintAvatar(ui.chatAvatar,directPeer(state.activeConversation),name);
   ui.chatTitle.textContent = name;
-  ui.chatStatus.textContent = conversationStatus(conversation);
   const peer = directPeer(conversation);
+  const status = conversationStatus(conversation);
+  ui.chatStatus.textContent = peer?.username ? `@${peer.username} · ${status}` : status;
   ui.chatStatus.classList.toggle("online", Boolean(peer && state.online.has(peer.id)));
   const canCall = conversation.kind === "direct";
   ui.audioCallButton.classList.toggle("hidden", !canCall);
@@ -583,7 +585,7 @@ function updateReadReceipts() {
   }
 }
 
-async function openConversation(id) {
+async function openConversation(id, { syncUrl = true } = {}) {
   const conversation = state.conversations.find(c => c.id === id);
   if (!conversation) return;
   if (state.activeConversation) {
@@ -608,6 +610,7 @@ async function openConversation(id) {
   ui.chatPane.classList.remove("empty");
   ui.appView.classList.add("chat-open");
   updateChatHeader();
+  if (syncUrl) syncConversationUrl(conversation);
   await renderConversationList();
   await loadMessages();
 }
@@ -1078,6 +1081,85 @@ function showFileRetry(file,error){
 }
 
 
+function parseChatRoute() {
+  if (location.pathname.startsWith("/invite/")) return null;
+  let raw = "";
+  try { raw = decodeURIComponent(location.hash.replace(/^#/, "").trim()); }
+  catch { raw = location.hash.replace(/^#/, "").trim(); }
+  const username = raw.match(/^@([A-Za-z][A-Za-z0-9_]{3,31})$/);
+  if (username) return { type: "username", username: username[1].toLowerCase() };
+  const numeric = raw.match(/^-?(\d{1,20})$/);
+  if (numeric) return { type: "chat", publicId: numeric[1].replace(/^0+(?=\d)/, "") };
+  return null;
+}
+
+function conversationHash(conversation) {
+  const peer = directPeer(conversation);
+  if (conversation.kind === "direct" && peer?.username) return `#@${peer.username}`;
+  if (conversation.public_id != null) return `#${conversation.public_id}`;
+  return "";
+}
+
+function syncConversationUrl(conversation) {
+  const hash = conversationHash(conversation);
+  if (!hash || location.hash.toLowerCase() === hash.toLowerCase()) return;
+  history.pushState({ conversation: String(conversation.public_id || conversation.id) }, "", `/${hash}`);
+}
+
+async function openUsernameChat(username, { syncUrl = false } = {}) {
+  const normalized = String(username || "").replace(/^@/, "").toLowerCase();
+  const known = state.conversations.find(c => c.kind === "direct" && directPeer(c)?.username?.toLowerCase() === normalized);
+  if (known) return openConversation(known.id, { syncUrl });
+  const info = await api(`/api/users/by-username/${encodeURIComponent(normalized)}`);
+  const peer = info.user;
+  if (peer.id === state.me.id) { openProfile(); return; }
+
+  const roomKey = await generateRoomKey();
+  const context = `direct:${crypto.randomUUID()}`;
+  const selfWrapped = await wrapRoomKey(roomKey, state.privateKey, state.me.public_key_jwk, context);
+  const peerWrapped = await wrapRoomKey(roomKey, state.privateKey, peer.public_key_jwk, context);
+  const created = await api(`/api/direct/by-username/${encodeURIComponent(normalized)}`, {
+    method: "POST",
+    body: JSON.stringify({
+      selfEnvelope: { iv: selfWrapped.iv, ciphertext: JSON.stringify({ context, data: selfWrapped.ciphertext }) },
+      peerEnvelope: { iv: peerWrapped.iv, ciphertext: JSON.stringify({ context, data: peerWrapped.ciphertext }) }
+    })
+  });
+  if (!created.existing) state.roomKeys.set(created.conversationId, roomKey);
+  await loadConversations();
+  return openConversation(created.conversationId, { syncUrl });
+}
+
+async function handleChatRoute() {
+  if (!state.me || state.pendingInvite) return;
+  const request = ++state.routeRequest;
+  const route = parseChatRoute();
+  if (!route) return;
+  try {
+    if (route.type === "username") {
+      await openUsernameChat(route.username, { syncUrl: false });
+      return;
+    }
+    const conversation = state.conversations.find(c => String(c.public_id) === route.publicId);
+    if (request !== state.routeRequest) return;
+    if (!conversation) return showToast(bt("chatNotFound"));
+    await openConversation(conversation.id, { syncUrl: false });
+  } catch (error) {
+    if (request !== state.routeRequest) return;
+    showToast(error?.status === 404 ? bt("userNotFound") : t("serverError"));
+  }
+}
+
+let routeScheduled = false;
+function scheduleChatRoute() {
+  if (routeScheduled) return;
+  routeScheduled = true;
+  queueMicrotask(() => {
+    routeScheduled = false;
+    handleChatRoute().catch(() => showToast(t("serverError")));
+  });
+}
+
 function capturePendingInvite() {
   const match = location.pathname.match(/^\/invite\/([A-Za-z0-9_-]+)\/?$/);
   const fragment = new URLSearchParams(location.hash.replace(/^#/, ""));
@@ -1237,7 +1319,9 @@ async function renderChatInfo() {
   if (!conversation) return;
 
   ui.infoTitle.textContent = conversationName(conversation);
-  ui.infoSubtitle.textContent = conversationStatus(conversation);
+  ui.infoSubtitle.textContent = conversation.public_id
+    ? `${conversationStatus(conversation)} · ID ${conversation.public_id}`
+    : conversationStatus(conversation);
   ui.infoDescription.textContent = conversation.description || "";
   ui.infoDescription.classList.toggle("hidden", !conversation.description);
   ui.memberCount.textContent = String(conversation.members.length);
@@ -1269,7 +1353,7 @@ async function renderChatInfo() {
       ? `${member.displayName || member.display_name} · ${t("you")}`
       : (member.displayName || member.display_name);
     const role = document.createElement("span");
-    role.textContent = roleLabel(member.role);
+    role.textContent = `${member.username ? "@" + member.username + " · " : ""}${roleLabel(member.role)}`;
     meta.append(name, role);
     row.append(avatar, meta);
 
@@ -2113,6 +2197,7 @@ async function enterMessenger() {
   await loadConversations();
   connectSocket();
   if (state.pendingInvite) await acceptPendingInvite();
+  else await handleChatRoute();
 }
 
 async function boot() {
@@ -2190,6 +2275,17 @@ ui.muteConversationButton.addEventListener("click", () => toggleConversationNoti
 ui.toggleCommentsButton.addEventListener("click", () => toggleChannelComments().catch(() => showToast(t("serverError"))));
 
 ui.chatSearch.addEventListener("input", renderConversationList);
+ui.chatSearch.addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  const value = ui.chatSearch.value.trim();
+  if (/^@[A-Za-z][A-Za-z0-9_]{3,31}$/.test(value)) {
+    event.preventDefault();
+    location.hash = value;
+  } else if (/^-?\d{1,20}$/.test(value)) {
+    event.preventDefault();
+    location.hash = value;
+  }
+});
 ui.backButton.addEventListener("click", () => ui.appView.classList.remove("chat-open"));
 ui.chatInfoButton.addEventListener("click", () => openChatInfo().catch(() => showToast(t("serverError"))));
 ui.closeChatInfoButton.addEventListener("click", () => ui.chatInfoModal.classList.add("hidden"));
@@ -2249,6 +2345,8 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 window.addEventListener("online", connectSocket);
+window.addEventListener("hashchange", scheduleChatRoute);
+window.addEventListener("popstate", scheduleChatRoute);
 ui.attachButton.addEventListener("click", () => ui.fileInput.click());
 ui.fileInput.addEventListener("change", async () => {
   const files = [...(ui.fileInput.files || [])];
@@ -2280,9 +2378,9 @@ window.addEventListener("beforeunload", () => {
 setAuthMode("login");
 
 const basicsCopy={
- ru:{profile:"Мой профиль",name:"Имя",username:"Юзернейм",hint:"4–32 символа: латинские буквы, цифры и _. Начните с буквы.",photo:"Изменить фото",remove:"Удалить фото",save:"Сохранить",saved:"Профиль сохранён",invalid_profile:"Проверьте имя и юзернейм",username_taken:"Этот юзернейм уже занят",invalid_avatar:"Не удалось прочитать изображение",upload:"Отправка файла…",tooLarge:"Файл больше 50 МБ",retry:"Повторить отправку",audio:"Аудиозвонок",video:"Видеозвонок",ringing:"Вызов",missed:"Без ответа",declined:"Отклонён",ended:"Завершён",connected:"Соединение",open:"Открыть фото"},
- en:{profile:"My profile",name:"Name",username:"Username",hint:"4–32 letters, digits or _. Start with a letter.",photo:"Change photo",remove:"Remove photo",save:"Save",saved:"Profile saved",invalid_profile:"Check name and username",username_taken:"Username is taken",invalid_avatar:"Cannot read image",upload:"Sending file…",tooLarge:"File exceeds 50 MB",retry:"Retry upload",audio:"Voice call",video:"Video call",ringing:"Calling",missed:"No answer",declined:"Declined",ended:"Ended",connected:"Connected",open:"Open photo"},
- uk:{profile:"Мій профіль",name:"Ім’я",username:"Юзернейм",hint:"4–32 символи: латинські літери, цифри та _. Почніть з літери.",photo:"Змінити фото",remove:"Видалити фото",save:"Зберегти",saved:"Профіль збережено",invalid_profile:"Перевірте ім’я та юзернейм",username_taken:"Цей юзернейм вже зайнятий",invalid_avatar:"Не вдалося прочитати зображення",upload:"Надсилання файлу…",tooLarge:"Файл більший за 50 МБ",retry:"Повторити надсилання",audio:"Аудіодзвінок",video:"Відеодзвінок",ringing:"Виклик",missed:"Без відповіді",declined:"Відхилено",ended:"Завершено",connected:"З’єднання",open:"Відкрити фото"}
+ ru:{profile:"Мой профиль",name:"Имя",username:"Юзернейм",hint:"4–32 символа: латинские буквы, цифры и _. Начните с буквы.",photo:"Изменить фото",remove:"Удалить фото",save:"Сохранить",saved:"Профиль сохранён",invalid_profile:"Проверьте имя и юзернейм",username_taken:"Этот юзернейм уже занят",invalid_avatar:"Не удалось прочитать изображение",upload:"Отправка файла…",tooLarge:"Файл больше 50 МБ",retry:"Повторить отправку",audio:"Аудиозвонок",video:"Видеозвонок",ringing:"Вызов",missed:"Без ответа",declined:"Отклонён",ended:"Завершён",connected:"Соединение",open:"Открыть фото",chatNotFound:"Чат с таким ID не найден",userNotFound:"Пользователь не найден"},
+ en:{profile:"My profile",name:"Name",username:"Username",hint:"4–32 letters, digits or _. Start with a letter.",photo:"Change photo",remove:"Remove photo",save:"Save",saved:"Profile saved",invalid_profile:"Check name and username",username_taken:"Username is taken",invalid_avatar:"Cannot read image",upload:"Sending file…",tooLarge:"File exceeds 50 MB",retry:"Retry upload",audio:"Voice call",video:"Video call",ringing:"Calling",missed:"No answer",declined:"Declined",ended:"Ended",connected:"Connected",open:"Open photo",chatNotFound:"Chat with this ID was not found",userNotFound:"User not found"},
+ uk:{profile:"Мій профіль",name:"Ім’я",username:"Юзернейм",hint:"4–32 символи: латинські літери, цифри та _. Почніть з літери.",photo:"Змінити фото",remove:"Видалити фото",save:"Зберегти",saved:"Профіль збережено",invalid_profile:"Перевірте ім’я та юзернейм",username_taken:"Цей юзернейм вже зайнятий",invalid_avatar:"Не вдалося прочитати зображення",upload:"Надсилання файлу…",tooLarge:"Файл більший за 50 МБ",retry:"Повторити надсилання",audio:"Аудіодзвінок",video:"Відеодзвінок",ringing:"Виклик",missed:"Без відповіді",declined:"Відхилено",ended:"Завершено",connected:"З’єднання",open:"Відкрити фото",chatNotFound:"Чат із таким ID не знайдено",userNotFound:"Користувача не знайдено"}
 };
 function bt(key){return basicsCopy[getLanguage()]?.[key]||basicsCopy.en[key]||t("serverError");}
 function paintAvatar(host,user,label){

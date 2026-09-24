@@ -35,6 +35,48 @@ export function installProfiles(app, {db, auth, express, emitToUser}) {
       res.json({user:r.rows[0]});
     }catch(e){next(e);}
   });
+  app.post("/api/direct/by-username/:username",auth,async(req,res,next)=>{
+    const username=String(req.params.username||"").replace(/^@/,"").toLowerCase();
+    if(!/^[a-z][a-z0-9_]{3,31}$/.test(username)) return res.status(400).json({error:"invalid_profile"});
+    if(!req.body?.selfEnvelope?.iv||!req.body?.selfEnvelope?.ciphertext||!req.body?.peerEnvelope?.iv||!req.body?.peerEnvelope?.ciphertext)
+      return res.status(400).json({error:"missing_key_envelope"});
+    const client=await db.connect();
+    try{
+      await client.query("BEGIN");
+      const found=await client.query("SELECT id,display_name,username,avatar_version,public_key_jwk FROM users WHERE username=$1",[username]);
+      const target=found.rows[0];
+      if(!target){await client.query("ROLLBACK");return res.status(404).json({error:"not_found"});}
+      if(target.id===req.user.id){await client.query("ROLLBACK");return res.status(409).json({error:"self_chat"});}
+      const pair=[req.user.id,target.id].sort().join(":");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))",[pair]);
+      const existing=await client.query(`SELECT c.id,c.public_id FROM conversations c
+        WHERE c.kind='direct'
+          AND EXISTS(SELECT 1 FROM conversation_members a WHERE a.conversation_id=c.id AND a.user_id=$1)
+          AND EXISTS(SELECT 1 FROM conversation_members b WHERE b.conversation_id=c.id AND b.user_id=$2)
+          AND (SELECT count(*) FROM conversation_members x WHERE x.conversation_id=c.id)=2
+        ORDER BY c.created_at LIMIT 1`,[req.user.id,target.id]);
+      if(existing.rowCount){
+        await client.query("COMMIT");
+        return res.json({conversationId:existing.rows[0].id,publicId:existing.rows[0].public_id,existing:true});
+      }
+      const made=await client.query("INSERT INTO conversations(kind,title,created_by) VALUES('direct',NULL,$1) RETURNING id,public_id",[req.user.id]);
+      const conversation=made.rows[0];
+      await client.query(`INSERT INTO conversation_members(conversation_id,user_id,role)
+        VALUES($1,$2,'member'),($1,$3,'member')`,[conversation.id,req.user.id,target.id]);
+      await client.query(`INSERT INTO conversation_keys(conversation_id,user_id,wrapped_by_user_id,iv,ciphertext)
+        VALUES($1,$2,$2,$4,$5),($1,$3,$2,$6,$7)`,[
+        conversation.id,req.user.id,target.id,
+        req.body.selfEnvelope.iv,req.body.selfEnvelope.ciphertext,
+        req.body.peerEnvelope.iv,req.body.peerEnvelope.ciphertext
+      ]);
+      await client.query("COMMIT");
+      const event={type:"conversation-created",conversationId:conversation.id};
+      emitToUser(req.user.id,event);emitToUser(target.id,event);
+      res.status(201).json({conversationId:conversation.id,publicId:conversation.public_id,existing:false});
+    }catch(e){await client.query("ROLLBACK").catch(()=>{});next(e);}
+    finally{client.release();}
+  });
+
   async function changed(userId){
     const r=await db.query("SELECT DISTINCT b.user_id FROM conversation_members a JOIN conversation_members b ON a.conversation_id=b.conversation_id WHERE a.user_id=$1",[userId]);
     for(const id of new Set([userId,...r.rows.map(x=>x.user_id)]))emitToUser(id,{type:"profile-updated",userId});

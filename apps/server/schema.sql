@@ -213,6 +213,14 @@ CREATE INDEX IF NOT EXISTS idx_reactions_message
 CREATE INDEX IF NOT EXISTS idx_pins_conversation
   ON conversation_pins(conversation_id, pinned_at DESC);
 
+-- Public numeric IDs are used only in browser deep-links. Internal relations stay UUID-based.
+CREATE SEQUENCE IF NOT EXISTS conversation_public_id_seq AS bigint START WITH 100000001;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS public_id bigint;
+UPDATE conversations SET public_id=nextval('conversation_public_id_seq') WHERE public_id IS NULL;
+ALTER TABLE conversations ALTER COLUMN public_id SET DEFAULT nextval('conversation_public_id_seq');
+ALTER TABLE conversations ALTER COLUMN public_id SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS conversations_public_id_unique ON conversations(public_id);
+
 ALTER TABLE users ADD COLUMN IF NOT EXISTS username text;
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique ON users(username) WHERE username IS NOT NULL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data bytea;
