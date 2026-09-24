@@ -212,3 +212,21 @@ CREATE INDEX IF NOT EXISTS idx_reactions_message
   ON message_reactions(message_id);
 CREATE INDEX IF NOT EXISTS idx_pins_conversation
   ON conversation_pins(conversation_id, pinned_at DESC);
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username text;
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_unique ON users(username) WHERE username IS NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_data bytea;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_version uuid;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS system_event jsonb;
+CREATE TABLE IF NOT EXISTS call_history(
+ id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+ conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+ caller_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ callee_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ message_id bigint NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+ video boolean NOT NULL DEFAULT false,
+ status text NOT NULL DEFAULT 'ringing',
+ created_at timestamptz NOT NULL DEFAULT now(),
+ accepted_at timestamptz, ended_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS calls_one_active ON call_history(conversation_id) WHERE ended_at IS NULL;

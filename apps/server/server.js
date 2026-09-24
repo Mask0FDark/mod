@@ -1,3 +1,5 @@
+import { installProfiles } from "./profiles.js";
+import { installCallHistory } from "./calls.js";
 import crypto from "crypto";
 import fs from "fs";
 import http from "http";
@@ -22,7 +24,7 @@ const TURN_PORT = Number(process.env.TURN_PORT || 3478);
 const TURN_SECRET = process.env.TURN_SECRET || "";
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const SESSION_DAYS = 30;
-const MAX_UPLOAD = 12 * 1024 * 1024;
+const MAX_UPLOAD = 50 * 1024 * 1024 + 16;
 const SMTP_HOST = process.env.SMTP_HOST || "";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || "false") === "true";
@@ -127,7 +129,7 @@ async function getSession(req) {
   const token = cookieMap(req).m0d_session;
   if (!token) return null;
   const result = await db.query(
-    `SELECT u.id,u.email,u.display_name,u.public_key_jwk,u.encrypted_private_key
+    `SELECT u.id,u.email,u.display_name,u.username,u.avatar_version,u.public_key_jwk,u.encrypted_private_key
        FROM sessions s
        JOIN users u ON u.id=s.user_id
       WHERE s.token_hash=$1 AND s.expires_at>now()`,
@@ -399,6 +401,9 @@ app.post("/api/auth/logout", auth, async (req, res, next) => {
   }
 });
 
+installProfiles(app, {db,auth,express,emitToUser});
+const callHistory=installCallHistory({db,emitConversation});
+
 app.get("/api/me", auth, (req, res) => {
   res.json({ user: req.user });
 });
@@ -590,14 +595,14 @@ app.get("/api/conversations", auth, async (req, res, next) => {
               mine.role AS my_role,mine.last_read_message_id,mine.notifications_enabled,
               ck.iv AS key_iv,ck.ciphertext AS key_ciphertext,ck.wrapped_by_user_id,
               COALESCE(json_agg(json_build_object(
-                'id',u.id,'displayName',u.display_name,'publicKeyJwk',u.public_key_jwk,
+                'id',u.id,'displayName',u.display_name,'username',u.username,'avatarVersion',u.avatar_version,'publicKeyJwk',u.public_key_jwk,
                 'role',cm.role,'lastReadMessageId',cm.last_read_message_id
               ) ORDER BY
                 CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
                 u.display_name
               ) FILTER (WHERE u.id IS NOT NULL),'[]') AS members,
               lm.id AS last_message_id,lm.sender_id AS last_sender_id,
-              lm.ciphertext AS last_ciphertext,lm.iv AS last_iv,lm.created_at AS last_message_at,
+              lm.system_event AS last_system_event,lm.ciphertext AS last_ciphertext,lm.iv AS last_iv,lm.created_at AS last_message_at,
               COALESCE(unread.unread_count,0)::int AS unread_count,
               COALESCE(pins.pinned_count,0)::int AS pinned_count
        FROM conversations c
@@ -606,9 +611,9 @@ app.get("/api/conversations", auth, async (req, res, next) => {
        JOIN conversation_members cm ON cm.conversation_id=c.id
        JOIN users u ON u.id=cm.user_id
        LEFT JOIN LATERAL (
-         SELECT id,sender_id,ciphertext,iv,created_at
+         SELECT id,sender_id,ciphertext,iv,created_at,system_event
          FROM messages
-         WHERE conversation_id=c.id
+         WHERE conversation_id=c.id AND thread_root_id IS NULL
          ORDER BY id DESC LIMIT 1
        ) lm ON true
        LEFT JOIN LATERAL (
@@ -617,7 +622,7 @@ app.get("/api/conversations", auth, async (req, res, next) => {
          WHERE um.conversation_id=c.id
            AND um.id>mine.last_read_message_id
            AND um.sender_id<>$1
-           AND um.deleted_at IS NULL
+           AND um.deleted_at IS NULL AND um.thread_root_id IS NULL
        ) unread ON true
        LEFT JOIN LATERAL (
          SELECT count(*) AS pinned_count
@@ -626,7 +631,7 @@ app.get("/api/conversations", auth, async (req, res, next) => {
        ) pins ON true
        GROUP BY c.id,mine.role,mine.last_read_message_id,mine.notifications_enabled,
                 ck.iv,ck.ciphertext,ck.wrapped_by_user_id,
-                lm.id,lm.sender_id,lm.ciphertext,lm.iv,lm.created_at,
+                lm.id,lm.sender_id,lm.ciphertext,lm.iv,lm.created_at,lm.system_event,
                 unread.unread_count,pins.pinned_count
        ORDER BY COALESCE(lm.created_at,c.created_at) DESC`,
       [req.user.id]
@@ -779,7 +784,7 @@ app.get("/api/conversations/:id/pins", auth, async (req, res, next) => {
     }
     const result = await db.query(
       `SELECT m.id,m.conversation_id,m.sender_id,m.ciphertext,m.iv,m.attachment_id,
-              m.reply_to_id,m.thread_root_id,m.edited_at,m.deleted_at,m.created_at,
+              m.reply_to_id,m.thread_root_id,m.edited_at,m.deleted_at,m.created_at,m.system_event,
               u.display_name AS sender_name,p.pinned_at
        FROM conversation_pins p
        JOIN messages m ON m.id=p.message_id
@@ -817,7 +822,7 @@ app.get("/api/conversations/:id/messages", auth, async (req, res, next) => {
 
     const result = await db.query(
       `SELECT m.id,m.conversation_id,m.sender_id,m.ciphertext,m.iv,m.attachment_id,
-              m.reply_to_id,m.thread_root_id,m.edited_at,m.deleted_at,m.created_at,
+              m.reply_to_id,m.thread_root_id,m.edited_at,m.deleted_at,m.created_at,m.system_event,
               u.display_name AS sender_name,
               COALESCE(rr.reactions,'[]'::json) AS reactions,
               EXISTS(
@@ -943,6 +948,7 @@ app.patch("/api/conversations/:id/messages/:messageId", auth, async (req, res, n
 
     const current = await messageDetails(messageId, conversationId);
     if (!current || current.deleted_at) return res.status(404).json({ error: "not_found" });
+    if (current.system_event) return res.status(400).json({error:"system_message"});
     if (current.sender_id !== req.user.id) return res.status(403).json({ error: "forbidden" });
 
     const ciphertext = String(req.body?.ciphertext || "");
@@ -1272,6 +1278,7 @@ wss.on("connection", async (ws, req) => {
       );
       if (!allowed.rowCount) return;
 
+      await callHistory.signal(msg,userId,to,conversationId);
       emitToUser(to, {
         type: msg.type,
         from: userId,
@@ -1288,6 +1295,7 @@ wss.on("connection", async (ws, req) => {
     current?.delete(ws);
     if (current && current.size === 0) {
       socketsByUser.delete(userId);
+      await callHistory.disconnected(userId).catch(() => {});
       await broadcastPresence(userId, false).catch(() => {});
     }
   });

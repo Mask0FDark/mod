@@ -408,6 +408,7 @@ function readableSize(bytes) {
 }
 
 async function previewFor(conversation) {
+  if (conversation.last_system_event) return callText(conversation.last_system_event);
   if (!conversation.last_ciphertext) return t("encrypted");
   try {
     const roomKey = await unlockConversationKey(conversation);
@@ -425,7 +426,7 @@ async function previewFor(conversation) {
 
 async function renderConversationList() {
   const query = ui.chatSearch.value.trim().toLowerCase();
-  const list = state.conversations.filter(c => conversationName(c).toLowerCase().includes(query));
+  const list = state.conversations.filter(c => (conversationName(c)+" "+c.members.map(m=>m.username?"@"+m.username:"").join(" ")).toLowerCase().includes(query));
   ui.chatList.replaceChildren();
 
   if (!list.length) {
@@ -443,7 +444,7 @@ async function renderConversationList() {
 
     const avatar = document.createElement("div");
     avatar.className = "avatar";
-    avatar.textContent = firstLetter(conversationName(conversation));
+    paintAvatar(avatar,directPeer(conversation),conversationName(conversation));
 
     const main = document.createElement("div");
     main.className = "chat-row-main";
@@ -505,7 +506,7 @@ function updateChatHeader() {
   const conversation = state.activeConversation;
   if (!conversation) return;
   const name = conversationName(conversation);
-  ui.chatAvatar.textContent = firstLetter(name);
+  paintAvatar(ui.chatAvatar,directPeer(state.activeConversation),name);
   ui.chatTitle.textContent = name;
   ui.chatStatus.textContent = conversationStatus(conversation);
   const peer = directPeer(conversation);
@@ -653,7 +654,8 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
   roomKey ||= await unlockConversationKey(conversation);
 
   let body = { text: "" };
-  if (!message.deleted_at) {
+  if (message.system_event) { body = {text:callText(message.system_event)}; }
+  else if (!message.deleted_at) {
     try {
       body = await decryptJson(roomKey, { iv: message.iv, ciphertext: message.ciphertext });
     } catch {
@@ -667,6 +669,8 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
   const mine = message.sender_id === state.me.id;
   row.className = "message-row " + (mine ? "out" : "in");
   row.dataset.messageId = message.id;
+  row.classList.toggle("channel-post",conversation.kind==="channel"&&!isThread);
+  if(message.system_event)row.classList.add("call-message");
 
   const bubble = document.createElement("div");
   bubble.className = "message-bubble" + (message.deleted_at ? " deleted" : "");
@@ -741,7 +745,7 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
     bubble.appendChild(reactionRow);
   }
 
-  if (!message.deleted_at) {
+  if (!message.deleted_at && !message.system_event) {
     const actions = document.createElement("div");
     actions.className = "message-actions";
 
@@ -830,50 +834,57 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
 }
 
 async function renderAttachment(host, attachment, roomKey) {
-  const response = await fetch(`/api/attachments/${attachment.id}`);
-  if (!response.ok) throw new Error("attachment_download_failed");
-  const ciphertext = await response.arrayBuffer();
-  const plaintext = await decryptBytes(roomKey, { iv: attachment.iv, ciphertext });
-
-  if (attachment.kind === "image") {
-    const blob = new Blob([plaintext], { type: attachment.mime || "image/webp" });
-    const url = URL.createObjectURL(blob);
-    const image = document.createElement("img");
-    image.className = "message-image";
-    image.alt = attachment.name || t("photo");
-    image.src = url;
-    image.onload = () => URL.revokeObjectURL(url);
-    host.appendChild(image);
-    return;
+  const card=document.createElement("div");card.className="file-card";
+  const meta=document.createElement("div");meta.className="file-meta";
+  const name=document.createElement("strong");name.textContent=attachment.name||t("file");
+  const size=document.createElement("span");size.textContent=readableSize(attachment.size);
+  meta.append(name,size);
+  const download=document.createElement("button");download.className="file-download";download.textContent=t("download");
+  card.append(meta,download);host.append(card);
+  let objectUrl=null,loading=null;
+  async function load(){
+    if(objectUrl)return objectUrl;
+    if(loading)return loading;
+    loading=(async()=>{
+      const response=await fetch(`/api/attachments/${attachment.id}`);
+      if(!response.ok)throw new Error("attachment_download_failed");
+      const plaintext=await decryptBytes(roomKey,{iv:attachment.iv,ciphertext:await response.arrayBuffer()});
+      objectUrl=URL.createObjectURL(new Blob([plaintext],{type:attachment.mime||"application/octet-stream"}));
+      host.dataset.objectUrl=objectUrl;return objectUrl;
+    })();
+    try{return await loading;}finally{loading=null;}
   }
-
-  const card = document.createElement("div");
-  card.className = "file-card";
-  const icon = document.createElement("div");
-  icon.className = "file-icon";
-  icon.textContent = "↓";
-  const meta = document.createElement("div");
-  meta.className = "file-meta";
-  const name = document.createElement("strong");
-  name.textContent = attachment.name || t("file");
-  const size = document.createElement("span");
-  size.textContent = readableSize(attachment.size);
-  meta.append(name, size);
-  const download = document.createElement("button");
-  download.className = "file-download";
-  download.textContent = t("download");
-  download.addEventListener("click", () => {
-    const blob = new Blob([plaintext], { type: attachment.mime || "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = attachment.name || "M0D-file";
-    anchor.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1500);
-  });
-  card.append(icon, meta, download);
-  host.appendChild(card);
+  download.onclick=async()=>{
+    download.disabled=true;
+    try{
+      const a=document.createElement("a");
+      a.href=await load();a.download=attachment.name||"M0D-file";a.style.display="none";
+      document.body.append(a);a.click();a.remove();
+    }catch{showToast(t("serverError"));}finally{download.disabled=false;}
+  };
+  if(attachment.kind==="image" && /^image\/(png|jpeg|webp|gif|avif|bmp)$/i.test(attachment.mime||"")){
+    const image=document.createElement("img");image.className="message-image";image.alt=attachment.name||t("photo");
+    host.prepend(image);image.src=await load();
+    image.onclick=()=>{
+      const overlay=document.createElement("div");overlay.className="media-viewer";
+      const enlarged=document.createElement("img");enlarged.src=objectUrl;enlarged.alt=image.alt;
+      const close=document.createElement("button");close.className="round-icon";close.textContent="✕";close.onclick=()=>overlay.remove();
+      overlay.append(enlarged,close);overlay.onclick=e=>{if(e.target===overlay)overlay.remove();};document.body.append(overlay);
+    };
+  }else if(["video","audio"].includes(attachment.kind)){
+    const play=document.createElement("button");play.className="media-load";play.textContent="▶ "+(attachment.name||t("file"));
+    host.prepend(play);
+    play.onclick=async()=>{
+      play.disabled=true;
+      try{
+        const media=document.createElement(attachment.kind);media.controls=true;media.preload="metadata";media.className="message-media";
+        if(attachment.kind==="video")media.playsInline=true;
+        media.src=await load();play.replaceWith(media);media.play().catch(()=>{});
+      }catch{play.disabled=false;showToast(t("serverError"));}
+    };
+  }
 }
+
 
 function autosizeComposer() {
   ui.messageInput.style.height = "auto";
@@ -1025,56 +1036,47 @@ async function compressImage(file) {
   return new File([blob], file.name.replace(/\.[^.]+$/, "") + ".webp", { type: "image/webp" });
 }
 
+const pendingFiles = new WeakMap();
 async function sendFile(file) {
-  const conversation = state.activeConversation;
-  if (!conversation || !file || !canPostToConversation(conversation)) return;
-  const reply = state.replyTo;
-
-  let prepared = file;
-  try {
-    prepared = await compressImage(file);
-  } catch {}
-
-  if (prepared.size > 10 * 1024 * 1024) {
-    showToast(t("imageTooLarge"));
-    return;
-  }
-
-  const roomKey = await unlockConversationKey(conversation);
-  const plaintext = await prepared.arrayBuffer();
-  const encryptedFile = await encryptBytes(roomKey, plaintext);
-  const upload = await api(`/api/conversations/${conversation.id}/attachments`, {
-    method: "POST",
-    headers: { "Content-Type": "application/octet-stream" },
-    body: encryptedFile.ciphertext
-  });
-
-  const body = {
-    version: 1,
-    text: "",
-    attachment: {
-      id: upload.id,
-      iv: encryptedFile.iv,
-      name: prepared.name,
-      mime: prepared.type || "application/octet-stream",
-      size: prepared.size,
-      kind: prepared.type.startsWith("image/") ? "image" : "file"
+  let pending=pendingFiles.get(file);
+  const conversation=pending?.conversation||state.activeConversation;
+  if(!conversation||!file||!canPostToConversation(conversation))return;
+  if(file.size>50*1024*1024){showToast(bt("tooLarge"));return;}
+  ui.attachButton.disabled=true;
+  showToast(bt("upload"),6000);
+  try{
+    if(!pending){
+      let prepared=file;try{prepared=await compressImage(file);}catch{}
+      const roomKey=await unlockConversationKey(conversation);
+      const encrypted=await encryptBytes(roomKey,await prepared.arrayBuffer());
+      pending={conversation,roomKey,prepared,encrypted,replyToId:state.replyTo?.id||null,clientMessageId:crypto.randomUUID()};
+      pendingFiles.set(file,pending);
     }
-  };
-  const encryptedMessage = await encryptJson(roomKey, body);
-  const result = await api(`/api/conversations/${conversation.id}/messages`, {
-    method: "POST",
-    body: JSON.stringify({
-      ...encryptedMessage,
-      clientMessageId: crypto.randomUUID(),
-      attachmentId: upload.id,
-      replyToId: reply?.id || null
-    })
-  });
-  await appendMessage(result.message, roomKey);
-  if (state.activeConversation?.id === conversation.id && state.replyTo === reply) clearComposerContext();
-  await loadConversations();
+    if(!pending.upload){
+      pending.upload=await api(`/api/conversations/${conversation.id}/attachments`,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:pending.encrypted.ciphertext});
+    }
+    if(!pending.payload){
+      const f=pending.prepared;
+      const body={version:1,text:"",attachment:{id:pending.upload.id,iv:pending.encrypted.iv,name:f.name,mime:f.type||"application/octet-stream",size:f.size,kind:f.type.startsWith("image/")?"image":f.type.startsWith("video/")?"video":f.type.startsWith("audio/")?"audio":"file"}};
+      pending.payload={...await encryptJson(pending.roomKey,body),clientMessageId:pending.clientMessageId,attachmentId:pending.upload.id,replyToId:pending.replyToId};
+      pending.encrypted=null;
+    }
+    const result=await api(`/api/conversations/${conversation.id}/messages`,{method:"POST",body:JSON.stringify(pending.payload)});
+    await appendMessage(result.message,pending.roomKey);
+    pendingFiles.delete(file);
+    await loadConversations();
+    if(state.activeConversation?.id===conversation.id){ui.messageList.scrollTop=ui.messageList.scrollHeight;if(state.replyTo?.id===pending.replyToId)clearComposerContext();}
+  }finally{ui.attachButton.disabled=!canPostToConversation(state.activeConversation);}
 }
+function showFileRetry(file,error){
+  const toast=document.createElement("div");toast.className="upload-retry";
+  const text=document.createElement("span");text.textContent=file.name+" — "+(error.status===413?bt("tooLarge"):t("serverError"));
+  const retry=document.createElement("button");retry.textContent=bt("retry");
+  retry.onclick=async()=>{retry.disabled=true;try{await sendFile(file);toast.remove();}catch(e){retry.disabled=false;}};
+  const close=document.createElement("button");close.textContent="✕";close.onclick=()=>{pendingFiles.delete(file);toast.remove();};
+  toast.append(text,retry,close);document.body.append(toast);
+}
+
 
 function capturePendingInvite() {
   const match = location.pathname.match(/^\/invite\/([A-Za-z0-9_-]+)\/?$/);
@@ -1258,7 +1260,7 @@ async function renderChatInfo() {
 
     const avatar = document.createElement("div");
     avatar.className = "avatar small";
-    avatar.textContent = firstLetter(member.displayName || member.display_name);
+    paintAvatar(avatar,member);
 
     const meta = document.createElement("div");
     meta.className = "member-meta";
@@ -1547,6 +1549,10 @@ function connectSocket() {
         return;
       }
 
+      if(message.type==="profile-updated"){
+        if(message.userId===state.me.id){const me=await api("/api/me");Object.assign(state.me,me.user);syncMe();}
+        await loadConversations();updateChatHeader();return;
+      }
       if (message.type === "typing") {
         if (state.activeConversation?.id === message.conversationId && message.userId !== state.me.id) {
           clearTimeout(state.remoteTypingTimer);
@@ -2098,7 +2104,7 @@ async function enterMessenger() {
   ui.appView.classList.remove("hidden");
   ui.meName.textContent = state.me.display_name;
   ui.meEmail.textContent = state.me.email;
-  ui.meAvatar.textContent = firstLetter(state.me.display_name);
+  syncMe();
   if ("Notification" in window && Notification.permission === "granted") {
     ui.enableNotificationsButton.dataset.i18n = "notificationsEnabled";
     applyTranslations();
@@ -2245,9 +2251,9 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("online", connectSocket);
 ui.attachButton.addEventListener("click", () => ui.fileInput.click());
 ui.fileInput.addEventListener("change", async () => {
-  const file = ui.fileInput.files?.[0];
+  const files = [...(ui.fileInput.files || [])];
   ui.fileInput.value = "";
-  if (file) await sendFile(file).catch(() => showToast(t("serverError")));
+  for(const file of files){try{await sendFile(file);}catch(e){showFileRetry(file,e);}}
 });
 
 ui.audioCallButton.addEventListener("click", () => startCall(false));
@@ -2272,6 +2278,77 @@ window.addEventListener("beforeunload", () => {
 });
 
 setAuthMode("login");
+
+const basicsCopy={
+ ru:{profile:"Мой профиль",name:"Имя",username:"Юзернейм",hint:"4–32 символа: латинские буквы, цифры и _. Начните с буквы.",photo:"Изменить фото",remove:"Удалить фото",save:"Сохранить",saved:"Профиль сохранён",invalid_profile:"Проверьте имя и юзернейм",username_taken:"Этот юзернейм уже занят",invalid_avatar:"Не удалось прочитать изображение",upload:"Отправка файла…",tooLarge:"Файл больше 50 МБ",retry:"Повторить отправку",audio:"Аудиозвонок",video:"Видеозвонок",ringing:"Вызов",missed:"Без ответа",declined:"Отклонён",ended:"Завершён",connected:"Соединение",open:"Открыть фото"},
+ en:{profile:"My profile",name:"Name",username:"Username",hint:"4–32 letters, digits or _. Start with a letter.",photo:"Change photo",remove:"Remove photo",save:"Save",saved:"Profile saved",invalid_profile:"Check name and username",username_taken:"Username is taken",invalid_avatar:"Cannot read image",upload:"Sending file…",tooLarge:"File exceeds 50 MB",retry:"Retry upload",audio:"Voice call",video:"Video call",ringing:"Calling",missed:"No answer",declined:"Declined",ended:"Ended",connected:"Connected",open:"Open photo"},
+ uk:{profile:"Мій профіль",name:"Ім’я",username:"Юзернейм",hint:"4–32 символи: латинські літери, цифри та _. Почніть з літери.",photo:"Змінити фото",remove:"Видалити фото",save:"Зберегти",saved:"Профіль збережено",invalid_profile:"Перевірте ім’я та юзернейм",username_taken:"Цей юзернейм вже зайнятий",invalid_avatar:"Не вдалося прочитати зображення",upload:"Надсилання файлу…",tooLarge:"Файл більший за 50 МБ",retry:"Повторити надсилання",audio:"Аудіодзвінок",video:"Відеодзвінок",ringing:"Виклик",missed:"Без відповіді",declined:"Відхилено",ended:"Завершено",connected:"З’єднання",open:"Відкрити фото"}
+};
+function bt(key){return basicsCopy[getLanguage()]?.[key]||basicsCopy.en[key]||t("serverError");}
+function paintAvatar(host,user,label){
+  host.replaceChildren(); host.textContent=firstLetter(label||user?.displayName||user?.display_name||"M");
+  const version=user?.avatarVersion||user?.avatar_version;
+  if(version && user?.id){
+    const img=document.createElement("img");img.alt="";img.src=`/api/users/${user.id}/avatar?v=${encodeURIComponent(version)}`;
+    img.addEventListener("error",()=>img.remove());host.append(img);
+  }
+}
+function syncMe(){
+  ui.meName.textContent=state.me.display_name;
+  ui.meEmail.textContent=state.me.username?"@"+state.me.username:bt("profile");
+  paintAvatar(ui.meAvatar,state.me);
+}
+function callText(event){
+  const duration=event.duration? ` · ${Math.floor(event.duration/60)}:${String(event.duration%60).padStart(2,"0")}`:"";
+  return (event.video?"◉ ":"☎ ")+bt(event.video?"video":"audio")+" · "+bt(event.status)+duration;
+}
+function openProfile(){
+  closeDrawer();
+  document.querySelectorAll(".profile-modal").forEach(node=>node.remove());
+  const modal=document.createElement("div");modal.className="modal profile-modal";
+  const form=document.createElement("form");form.className="modal-card profile-card";
+  form.innerHTML=`<header><h2>${bt("profile")}</h2><button type="button" class="round-icon profile-close">✕</button></header><div class="profile-photo-row"><div class="avatar large profile-preview"></div><button type="button" class="secondary-button choose-avatar">${bt("photo")}</button><button type="button" class="round-icon remove-avatar" title="${bt("remove")}">⌫</button></div><input class="avatar-input" type="file" accept="image/*" hidden><label class="field"><span>${bt("name")}</span><input class="profile-name" maxlength="40" required></label><label class="field"><span>${bt("username")}</span><input class="profile-username" maxlength="32" pattern="[a-zA-Z][a-zA-Z0-9_]{3,31}" placeholder="@username" autocomplete="off"></label><p class="profile-hint">${bt("hint")}</p><p class="profile-error" role="status"></p><button class="primary-button profile-save" type="submit">${bt("save")}</button>`;
+  modal.append(form);document.body.append(modal);
+  form.querySelector(".profile-name").value=state.me.display_name;
+  form.querySelector(".profile-username").value=state.me.username||"";
+  paintAvatar(form.querySelector(".profile-preview"),state.me);
+  let avatar=null,remove=false,previewUrl=null,busy=false;
+  const close=()=>{if(busy)return;if(previewUrl)URL.revokeObjectURL(previewUrl);modal.remove();};
+  form.querySelector(".profile-close").onclick=close;
+  modal.onclick=e=>{if(e.target===modal)close();};
+  const input=form.querySelector(".avatar-input");
+  form.querySelector(".choose-avatar").onclick=()=>input.click();
+  form.querySelector(".remove-avatar").onclick=()=>{remove=true;avatar=null;paintAvatar(form.querySelector(".profile-preview"),null,state.me.display_name);};
+  input.onchange=async()=>{
+    try{
+      const file=input.files[0];if(!file)return;
+      if(file.size>20*1024*1024)throw new Error("invalid_avatar");
+      const bitmap=await createImageBitmap(file);const canvas=document.createElement("canvas");canvas.width=canvas.height=256;
+      const side=Math.min(bitmap.width,bitmap.height);canvas.getContext("2d").drawImage(bitmap,(bitmap.width-side)/2,(bitmap.height-side)/2,side,side,0,0,256,256);bitmap.close();
+      avatar=await new Promise(r=>canvas.toBlob(r,"image/png"));if(!avatar)throw new Error("invalid_avatar");
+      remove=false;if(previewUrl)URL.revokeObjectURL(previewUrl);previewUrl=URL.createObjectURL(avatar);
+      const img=document.createElement("img");img.src=previewUrl;img.alt="";form.querySelector(".profile-preview").replaceChildren(img);
+    }catch(e){form.querySelector(".profile-error").textContent=bt("invalid_avatar");}
+  };
+  form.onsubmit=async e=>{
+    e.preventDefault();if(busy)return;busy=true;
+    const controls=[...form.querySelectorAll("button,input")];controls.forEach(x=>x.disabled=true);
+    try{
+      const r=await api("/api/me/profile",{method:"PATCH",body:JSON.stringify({displayName:form.querySelector(".profile-name").value,username:form.querySelector(".profile-username").value})});
+      Object.assign(state.me,r.user);
+      if(avatar){const a=await api("/api/me/avatar",{method:"PUT",headers:{"Content-Type":"image/png"},body:avatar});state.me.avatar_version=a.avatar_version;}
+      else if(remove){await api("/api/me/avatar",{method:"DELETE"});state.me.avatar_version=null;}
+      syncMe();await loadConversations();busy=false;close();showToast(bt("saved"));
+    }catch(e){form.querySelector(".profile-error").textContent=bt(e.code);}
+    finally{busy=false;controls.forEach(x=>x.disabled=false);}
+  };
+}
+ui.meAvatar.setAttribute("role","button");ui.meAvatar.tabIndex=0;ui.meAvatar.title=bt("profile");
+ui.meAvatar.addEventListener("click",openProfile);
+ui.meAvatar.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" ")openProfile();});
+const profileButton=document.createElement("button");profileButton.className="settings-action";profileButton.textContent=bt("profile");profileButton.onclick=openProfile;
+ui.settingsDrawer.querySelector(".drawer-section").prepend(profileButton);
+
 boot().catch(() => {
   ui.authView.classList.remove("hidden");
   ui.authError.textContent = t("serverError");
