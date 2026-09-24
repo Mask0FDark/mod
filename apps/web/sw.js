@@ -1,4 +1,4 @@
-const CACHE = "m0d-shell-v1";
+const CACHE = "m0d-shell-v2";
 const SHELL = ["/", "/styles.css", "/app.js", "/crypto.js", "/i18n.js", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", event => {

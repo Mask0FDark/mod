@@ -97,6 +97,7 @@
           </div>
           <button id="audioCallButton" class="round-icon" aria-label="Audio call" title="Audio call">☎</button>
           <button id="videoCallButton" class="round-icon" aria-label="Video call" title="Video call">◉</button>
+          <button id="chatInfoButton" class="round-icon" aria-label="Chat info" title="Chat info">⋮</button>
         </header>
 
         <section id="messageList" class="message-list"></section>
@@ -105,7 +106,15 @@
           <input id="fileInput" type="file" hidden accept="image/*,video/*,audio/*,.pdf,.txt,.zip">
           <button id="attachButton" class="composer-icon" aria-label="Attach">⌕</button>
           <div class="composer-box">
+            <div id="composerContext" class="composer-context hidden">
+              <div>
+                <strong id="composerContextTitle"></strong>
+                <span id="composerContextText"></span>
+              </div>
+              <button id="cancelComposerContext" class="context-close" type="button">✕</button>
+            </div>
             <textarea id="messageInput" rows="1" maxlength="12000" data-i18n-placeholder="message" placeholder="Сообщение"></textarea>
+            <div id="readOnlyHint" class="read-only-hint hidden" data-i18n="channelReadOnly">Публиковать могут только администраторы</div>
           </div>
           <button id="sendButton" class="send-button" aria-label="Send">➤</button>
         </footer>
@@ -129,6 +138,10 @@
           <button class="language-button" type="button" data-lang="uk">Українська</button>
         </div>
       </div>
+      <div class="drawer-section">
+        <span data-i18n="notifications">Уведомления</span>
+        <button id="enableNotificationsButton" class="settings-action" type="button" data-i18n="enableNotifications">Включить уведомления</button>
+      </div>
       <div class="drawer-note">
         <strong data-i18n="privacy">Конфиденциальность</strong>
         <p data-i18n="encryptionNote">Сообщения и вложения шифруются в браузере до отправки на сервер.</p>
@@ -150,19 +163,78 @@
         <select id="inviteKindInput">
           <option value="direct" data-i18n="directChat">Личный чат</option>
           <option value="group" data-i18n="groupChat">Группа</option>
+          <option value="channel" data-i18n="channel">Канал</option>
         </select>
       </label>
       <label id="groupTitleLabel" class="field hidden">
-        <span data-i18n="groupName">Название группы</span>
-        <input id="groupTitleInput" maxlength="40" data-i18n-placeholder="groupNamePlaceholder" placeholder="Название группы">
+        <span data-i18n="groupName">Название</span>
+        <input id="groupTitleInput" maxlength="40" data-i18n-placeholder="groupNamePlaceholder" placeholder="Название">
       </label>
-      <p class="modal-help" data-i18n="invitePrivacyHint">Email собеседника не нужен. Отправьте ему ссылку — после входа или регистрации он сразу попадёт в чат.</p>
+      <label id="descriptionLabel" class="field hidden">
+        <span data-i18n="description">Описание</span>
+        <textarea id="descriptionInput" rows="3" maxlength="500" data-i18n-placeholder="descriptionPlaceholder" placeholder="Описание"></textarea>
+      </label>
+      <p id="newChatHelp" class="modal-help" data-i18n="invitePrivacyHint">Email собеседника не нужен. Отправьте ему ссылку — после входа или регистрации он сразу попадёт в чат.</p>
       <div id="inviteResult" class="invite-result hidden">
         <input id="inviteLinkInput" readonly>
         <button id="copyInviteButton" class="primary-button" type="button" data-i18n="copyLink">Копировать ссылку</button>
       </div>
       <div id="newChatError" class="form-error"></div>
       <button id="createChatButton" class="primary-button" data-i18n="createInvite">Создать ссылку</button>
+    </div>
+  </div>
+
+  <div id="chatInfoModal" class="modal hidden">
+    <div class="modal-card info-card">
+      <header>
+        <div>
+          <h2 id="infoTitle">M0D</h2>
+          <p id="infoSubtitle"></p>
+        </div>
+        <button id="closeChatInfoButton" class="round-icon">✕</button>
+      </header>
+
+      <div id="infoDescription" class="info-description"></div>
+      <div class="info-actions">
+        <button id="shareInviteButton" class="primary-button" type="button" data-i18n="invitePeople">Пригласить</button>
+        <button id="editConversationButton" class="secondary-button hidden" type="button" data-i18n="editChat">Изменить</button>
+      </div>
+      <div class="info-actions">
+        <button id="muteConversationButton" class="secondary-button" type="button" data-i18n="muteChat">Выключить уведомления</button>
+        <button id="toggleCommentsButton" class="secondary-button hidden" type="button" data-i18n="disableComments">Отключить комментарии</button>
+      </div>
+
+      <div id="infoInviteResult" class="invite-result hidden">
+        <input id="infoInviteLink" readonly>
+        <button id="copyInfoInviteButton" class="primary-button" type="button" data-i18n="copyLink">Копировать ссылку</button>
+      </div>
+
+      <div class="info-section">
+        <div class="info-section-title">
+          <strong data-i18n="membersTitle">Участники</strong>
+          <span id="memberCount"></span>
+        </div>
+        <div id="memberList" class="member-list"></div>
+      </div>
+
+      <button id="leaveConversationButton" class="danger-text-button" type="button" data-i18n="leaveChat">Покинуть</button>
+    </div>
+  </div>
+
+  <div id="threadModal" class="modal thread-modal hidden">
+    <div class="modal-card thread-card">
+      <header>
+        <div>
+          <h2 data-i18n="comments">Комментарии</h2>
+          <p id="threadSubtitle"></p>
+        </div>
+        <button id="closeThreadButton" class="round-icon">✕</button>
+      </header>
+      <section id="threadMessageList" class="thread-message-list"></section>
+      <footer class="thread-composer">
+        <textarea id="threadInput" rows="1" maxlength="12000" data-i18n-placeholder="commentPlaceholder" placeholder="Комментарий"></textarea>
+        <button id="threadSendButton" class="send-button" type="button">➤</button>
+      </footer>
     </div>
   </div>
 

@@ -47,24 +47,55 @@ const ui = {
   chatStatus: $("chatStatus"),
   audioCallButton: $("audioCallButton"),
   videoCallButton: $("videoCallButton"),
+  chatInfoButton: $("chatInfoButton"),
   messageList: $("messageList"),
   fileInput: $("fileInput"),
   attachButton: $("attachButton"),
+  composerContext: $("composerContext"),
+  composerContextTitle: $("composerContextTitle"),
+  composerContextText: $("composerContextText"),
+  cancelComposerContext: $("cancelComposerContext"),
+  readOnlyHint: $("readOnlyHint"),
   messageInput: $("messageInput"),
   sendButton: $("sendButton"),
   drawerBackdrop: $("drawerBackdrop"),
   settingsDrawer: $("settingsDrawer"),
   closeDrawerButton: $("closeDrawerButton"),
+  enableNotificationsButton: $("enableNotificationsButton"),
   newChatModal: $("newChatModal"),
   closeNewChatButton: $("closeNewChatButton"),
   inviteKindInput: $("inviteKindInput"),
   groupTitleLabel: $("groupTitleLabel"),
   groupTitleInput: $("groupTitleInput"),
+  descriptionLabel: $("descriptionLabel"),
+  descriptionInput: $("descriptionInput"),
+  newChatHelp: $("newChatHelp"),
   inviteResult: $("inviteResult"),
   inviteLinkInput: $("inviteLinkInput"),
   copyInviteButton: $("copyInviteButton"),
   newChatError: $("newChatError"),
   createChatButton: $("createChatButton"),
+  chatInfoModal: $("chatInfoModal"),
+  closeChatInfoButton: $("closeChatInfoButton"),
+  infoTitle: $("infoTitle"),
+  infoSubtitle: $("infoSubtitle"),
+  infoDescription: $("infoDescription"),
+  shareInviteButton: $("shareInviteButton"),
+  editConversationButton: $("editConversationButton"),
+  muteConversationButton: $("muteConversationButton"),
+  toggleCommentsButton: $("toggleCommentsButton"),
+  infoInviteResult: $("infoInviteResult"),
+  infoInviteLink: $("infoInviteLink"),
+  copyInfoInviteButton: $("copyInfoInviteButton"),
+  memberCount: $("memberCount"),
+  memberList: $("memberList"),
+  leaveConversationButton: $("leaveConversationButton"),
+  threadModal: $("threadModal"),
+  closeThreadButton: $("closeThreadButton"),
+  threadSubtitle: $("threadSubtitle"),
+  threadMessageList: $("threadMessageList"),
+  threadInput: $("threadInput"),
+  threadSendButton: $("threadSendButton"),
   callOverlay: $("callOverlay"),
   remoteVideo: $("remoteVideo"),
   callBackdropAvatar: $("callBackdropAvatar"),
@@ -98,6 +129,12 @@ const state = {
   online: new Set(),
   ws: null,
   toastTimer: null,
+  replyTo: null,
+  editingMessage: null,
+  messageCache: new Map(),
+  threadRoot: null,
+  typingTimer: null,
+  remoteTypingTimer: null,
   call: {
     state: "idle",
     peerId: null,
@@ -282,8 +319,22 @@ async function submitAuth(event) {
 
 function conversationName(conversation) {
   if (conversation.kind === "group") return conversation.title || t("group");
+  if (conversation.kind === "channel") return conversation.title || t("channel");
   const other = conversation.members.find(member => member.id !== state.me.id);
   return other?.displayName || other?.display_name || "M0D";
+}
+
+function myRole(conversation) {
+  return conversation?.my_role || conversation?.members?.find(member => member.id === state.me?.id)?.role || "member";
+}
+
+function canManageConversation(conversation) {
+  return ["owner", "admin"].includes(myRole(conversation));
+}
+
+function canPostToConversation(conversation) {
+  if (!conversation) return false;
+  return conversation.kind !== "channel" || canManageConversation(conversation);
 }
 
 function directPeer(conversation) {
@@ -294,6 +345,9 @@ function directPeer(conversation) {
 function conversationStatus(conversation) {
   if (conversation.kind === "group") {
     return `${conversation.members.length} ${t("members")}`;
+  }
+  if (conversation.kind === "channel") {
+    return `${conversation.members.length} ${t("subscriber")}`;
   }
   const peer = directPeer(conversation);
   return peer && state.online.has(peer.id) ? t("online") : t("offline");
@@ -387,7 +441,10 @@ async function renderConversationList() {
         <span class="chat-row-name"></span>
         <span class="chat-time">${shortTime(conversation.last_message_at || conversation.created_at)}</span>
       </div>
-      <div class="chat-preview">🔒 ${t("encrypted")}</div>
+      <div class="chat-row-bottom">
+        <div class="chat-preview">🔒 ${t("encrypted")}</div>
+        <span class="unread-badge ${Number(conversation.unread_count || 0) > 0 ? "" : "hidden"}">${Number(conversation.unread_count || 0)}</span>
+      </div>
     `;
     main.querySelector(".chat-row-name").textContent = conversationName(conversation);
     row.append(avatar, main);
@@ -429,12 +486,40 @@ function updateChatHeader() {
   const canCall = conversation.kind === "direct";
   ui.audioCallButton.classList.toggle("hidden", !canCall);
   ui.videoCallButton.classList.toggle("hidden", !canCall);
+
+  const readOnly = conversation.kind === "channel" && !canPostToConversation(conversation);
+  ui.readOnlyHint.classList.toggle("hidden", !readOnly);
+  ui.messageInput.classList.toggle("hidden", readOnly);
+  ui.attachButton.classList.toggle("hidden", readOnly);
+  ui.sendButton.classList.toggle("hidden", readOnly);
+}
+
+function clearComposerContext() {
+  state.replyTo = null;
+  state.editingMessage = null;
+  ui.composerContext.classList.add("hidden");
+  ui.composerContextTitle.textContent = "";
+  ui.composerContextText.textContent = "";
+}
+
+async function markConversationRead(messageId) {
+  const conversation = state.activeConversation;
+  if (!conversation || !messageId) return;
+  conversation.unread_count = 0;
+  conversation.last_read_message_id = Math.max(Number(conversation.last_read_message_id || 0), Number(messageId));
+  await renderConversationList();
+  api(`/api/conversations/${conversation.id}/read`, {
+    method: "POST",
+    body: JSON.stringify({ messageId })
+  }).catch(() => {});
 }
 
 async function openConversation(id) {
   const conversation = state.conversations.find(c => c.id === id);
   if (!conversation) return;
   state.activeConversation = conversation;
+  clearComposerContext();
+  state.threadRoot = null;
   ui.emptyChat.classList.add("hidden");
   ui.activeChat.classList.remove("hidden");
   ui.chatPane.classList.remove("empty");
@@ -448,6 +533,7 @@ async function loadMessages() {
   const conversation = state.activeConversation;
   if (!conversation) return;
   ui.messageList.replaceChildren();
+  state.messageCache.clear();
 
   try {
     const roomKey = await unlockConversationKey(conversation);
@@ -455,6 +541,8 @@ async function loadMessages() {
     for (const message of result.messages || []) {
       await appendMessage(message, roomKey);
     }
+    const last = result.messages?.[result.messages.length - 1];
+    if (last) await markConversationRead(last.id);
     requestAnimationFrame(() => {
       ui.messageList.scrollTop = ui.messageList.scrollHeight;
     });
@@ -463,26 +551,30 @@ async function loadMessages() {
   }
 }
 
-async function appendMessage(message, roomKey = null) {
+async function appendMessage(message, roomKey = null, host = ui.messageList, isThread = false) {
   const conversation = state.conversations.find(c => c.id === message.conversation_id) || state.activeConversation;
   if (!conversation) return;
   roomKey ||= await unlockConversationKey(conversation);
 
-  let body;
-  try {
-    body = await decryptJson(roomKey, { iv: message.iv, ciphertext: message.ciphertext });
-  } catch {
-    body = { text: "🔒 " + t("encrypted") };
+  let body = { text: "" };
+  if (!message.deleted_at) {
+    try {
+      body = await decryptJson(roomKey, { iv: message.iv, ciphertext: message.ciphertext });
+    } catch {
+      body = { text: "🔒 " + t("encrypted") };
+    }
   }
+  state.messageCache.set(Number(message.id), { message, body });
 
   const row = document.createElement("div");
   const mine = message.sender_id === state.me.id;
   row.className = "message-row " + (mine ? "out" : "in");
+  row.dataset.messageId = message.id;
 
   const bubble = document.createElement("div");
-  bubble.className = "message-bubble";
+  bubble.className = "message-bubble" + (message.deleted_at ? " deleted" : "");
 
-  if (conversation.kind === "group" && !mine) {
+  if ((conversation.kind === "group" || conversation.kind === "channel" || isThread) && !mine) {
     const member = conversation.members.find(m => m.id === message.sender_id);
     const author = document.createElement("div");
     author.className = "message-author";
@@ -490,29 +582,141 @@ async function appendMessage(message, roomKey = null) {
     bubble.appendChild(author);
   }
 
-  if (body.attachment) {
-    const attachment = document.createElement("div");
-    attachment.className = "message-attachment";
-    bubble.appendChild(attachment);
-    renderAttachment(attachment, body.attachment, roomKey).catch(() => {
-      attachment.textContent = "🔒 " + t("file");
+  if (message.reply_to_id) {
+    const reply = document.createElement("button");
+    reply.className = "reply-preview";
+    reply.type = "button";
+    const cached = state.messageCache.get(Number(message.reply_to_id));
+    reply.textContent = cached?.body?.text
+      ? "↩ " + cached.body.text.slice(0, 90)
+      : "↩ #" + message.reply_to_id;
+    reply.addEventListener("click", () => {
+      const target = host.querySelector(`[data-message-id="${message.reply_to_id}"]`);
+      target?.scrollIntoView({ behavior: "smooth", block: "center" });
+      target?.classList.add("message-highlight");
+      setTimeout(() => target?.classList.remove("message-highlight"), 1200);
     });
+    bubble.appendChild(reply);
   }
 
-  if (body.text) {
-    const textNode = document.createElement("div");
-    textNode.className = "message-text";
-    textNode.textContent = body.text;
-    bubble.appendChild(textNode);
+  if (message.deleted_at) {
+    const deleted = document.createElement("div");
+    deleted.className = "message-text deleted-text";
+    deleted.textContent = t("messageDeleted");
+    bubble.appendChild(deleted);
+  } else {
+    if (body.attachment) {
+      const attachment = document.createElement("div");
+      attachment.className = "message-attachment";
+      bubble.appendChild(attachment);
+      renderAttachment(attachment, body.attachment, roomKey).catch(() => {
+        attachment.textContent = "🔒 " + t("file");
+      });
+    }
+
+    if (body.text) {
+      const textNode = document.createElement("div");
+      textNode.className = "message-text";
+      textNode.textContent = body.text;
+      bubble.appendChild(textNode);
+    }
+  }
+
+  const reactions = Array.isArray(message.reactions) ? message.reactions : [];
+  if (reactions.length) {
+    const reactionRow = document.createElement("div");
+    reactionRow.className = "reaction-row";
+    const grouped = new Map();
+    for (const reaction of reactions) {
+      const item = grouped.get(reaction.emoji) || { count: 0, mine: false };
+      item.count += 1;
+      if ((reaction.userId || reaction.user_id) === state.me.id) item.mine = true;
+      grouped.set(reaction.emoji, item);
+    }
+    for (const [emoji, info] of grouped) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "reaction-chip" + (info.mine ? " mine" : "");
+      chip.textContent = `${emoji} ${info.count}`;
+      chip.addEventListener("click", () => toggleReaction(message.id, emoji));
+      reactionRow.appendChild(chip);
+    }
+    bubble.appendChild(reactionRow);
+  }
+
+  if (!message.deleted_at) {
+    const actions = document.createElement("div");
+    actions.className = "message-actions";
+
+    const react = document.createElement("button");
+    react.type = "button";
+    react.textContent = "👍";
+    react.title = "Reaction";
+    react.addEventListener("click", () => toggleReaction(message.id, "👍"));
+    actions.appendChild(react);
+
+    if (!(conversation.kind === "channel" && !isThread && !message.thread_root_id)) {
+      const reply = document.createElement("button");
+      reply.type = "button";
+      reply.textContent = "↩";
+      reply.title = t("reply");
+      reply.addEventListener("click", () => beginReply(message, body, isThread));
+      actions.appendChild(reply);
+    }
+
+    if (mine) {
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.textContent = "✎";
+      edit.title = t("edit");
+      edit.addEventListener("click", () => beginEdit(message, body, isThread));
+      actions.appendChild(edit);
+    }
+
+    if (mine || canManageConversation(conversation)) {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.textContent = "⌫";
+      del.title = t("delete");
+      del.addEventListener("click", () => deleteMessage(message.id, isThread));
+      actions.appendChild(del);
+    }
+
+    if (canManageConversation(conversation) && !isThread) {
+      const pin = document.createElement("button");
+      pin.type = "button";
+      pin.textContent = message.pinned ? "📌" : "⌖";
+      pin.title = message.pinned ? t("unpin") : t("pin");
+      pin.addEventListener("click", () => togglePin(message.id));
+      actions.appendChild(pin);
+    }
+
+    bubble.appendChild(actions);
+  }
+
+  if (conversation.kind === "channel" && !isThread && !message.thread_root_id && !message.deleted_at) {
+    const comments = document.createElement("button");
+    comments.type = "button";
+    comments.className = "comments-button";
+    comments.textContent = `💬 ${Number(message.comment_count || 0)}`;
+    comments.disabled = conversation.comments_enabled === false;
+    comments.title = conversation.comments_enabled === false ? t("commentsDisabled") : t("comments");
+    comments.addEventListener("click", () => openThread(message, body));
+    bubble.appendChild(comments);
   }
 
   const meta = document.createElement("span");
   meta.className = "message-meta";
-  meta.textContent = shortTime(message.created_at);
+  let receipt = "";
+  if (mine && conversation.kind === "direct" && !message.deleted_at) {
+    const peer = directPeer(conversation);
+    receipt = Number(peer?.lastReadMessageId || 0) >= Number(message.id) ? " ✓✓" : " ✓";
+  }
+  meta.textContent = `${message.pinned ? "📌 " : ""}${message.edited_at ? t("edited") + " · " : ""}${shortTime(message.created_at)}${receipt}`;
   bubble.appendChild(meta);
 
   row.appendChild(bubble);
-  ui.messageList.appendChild(row);
+  host.appendChild(row);
 }
 
 async function renderAttachment(host, attachment, roomKey) {
@@ -566,19 +770,97 @@ function autosizeComposer() {
   ui.messageInput.style.height = Math.min(ui.messageInput.scrollHeight, 145) + "px";
 }
 
+function beginReply(message, body, isThread = false) {
+  if (isThread) {
+    state.threadReplyTo = message;
+    state.threadEditingMessage = null;
+    ui.threadSubtitle.textContent = `↩ ${body?.text?.slice(0, 80) || "#" + message.id}`;
+    ui.threadInput.focus();
+    return;
+  }
+  state.replyTo = message;
+  state.editingMessage = null;
+  ui.composerContextTitle.textContent = t("reply");
+  ui.composerContextText.textContent = body?.text?.slice(0, 100) || "#" + message.id;
+  ui.composerContext.classList.remove("hidden");
+  ui.messageInput.focus();
+}
+
+function beginEdit(message, body, isThread = false) {
+  if (isThread) {
+    state.threadEditingMessage = message;
+    state.threadReplyTo = null;
+    ui.threadSubtitle.textContent = t("edit");
+    ui.threadInput.value = body?.text || "";
+    ui.threadInput.focus();
+    return;
+  }
+  state.editingMessage = message;
+  state.replyTo = null;
+  ui.composerContextTitle.textContent = t("edit");
+  ui.composerContextText.textContent = body?.text?.slice(0, 100) || "#" + message.id;
+  ui.composerContext.classList.remove("hidden");
+  ui.messageInput.value = body?.text || "";
+  autosizeComposer();
+  ui.messageInput.focus();
+}
+
+async function deleteMessage(messageId, isThread = false) {
+  const conversation = state.activeConversation;
+  if (!conversation) return;
+  await api(`/api/conversations/${conversation.id}/messages/${messageId}`, { method: "DELETE" });
+  if (isThread) await loadThreadMessages();
+  else await loadMessages();
+  await loadConversations();
+}
+
+async function toggleReaction(messageId, emoji) {
+  const conversation = state.activeConversation;
+  if (!conversation) return;
+  await api(`/api/conversations/${conversation.id}/messages/${messageId}/reaction`, {
+    method: "POST",
+    body: JSON.stringify({ emoji })
+  });
+  if (state.threadRoot && !ui.threadModal.classList.contains("hidden")) await loadThreadMessages();
+  else await loadMessages();
+}
+
+async function togglePin(messageId) {
+  const conversation = state.activeConversation;
+  if (!conversation) return;
+  await api(`/api/conversations/${conversation.id}/messages/${messageId}/pin`, { method: "POST", body: "{}" });
+  await loadMessages();
+  await loadConversations();
+}
+
 async function sendText() {
   const conversation = state.activeConversation;
   const text = ui.messageInput.value.trim();
-  if (!conversation || !text) return;
+  if (!conversation || !text || !canPostToConversation(conversation)) return;
+
+  const roomKey = await unlockConversationKey(conversation);
+  const encrypted = await encryptJson(roomKey, { version: 1, text });
+
+  if (state.editingMessage) {
+    await api(`/api/conversations/${conversation.id}/messages/${state.editingMessage.id}`, {
+      method: "PATCH",
+      body: JSON.stringify(encrypted)
+    });
+  } else {
+    await api(`/api/conversations/${conversation.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...encrypted,
+        replyToId: state.replyTo?.id || null
+      })
+    });
+  }
 
   ui.messageInput.value = "";
   autosizeComposer();
-  const roomKey = await unlockConversationKey(conversation);
-  const encrypted = await encryptJson(roomKey, { version: 1, text });
-  await api(`/api/conversations/${conversation.id}/messages`, {
-    method: "POST",
-    body: JSON.stringify(encrypted)
-  });
+  clearComposerContext();
+  await loadMessages();
+  await loadConversations();
 }
 
 async function compressImage(file) {
@@ -603,7 +885,7 @@ async function compressImage(file) {
 
 async function sendFile(file) {
   const conversation = state.activeConversation;
-  if (!conversation || !file) return;
+  if (!conversation || !file || !canPostToConversation(conversation)) return;
 
   let prepared = file;
   try {
@@ -641,9 +923,11 @@ async function sendFile(file) {
     method: "POST",
     body: JSON.stringify({
       ...encryptedMessage,
-      attachmentId: upload.id
+      attachmentId: upload.id,
+      replyToId: state.replyTo?.id || null
     })
   });
+  clearComposerContext();
 }
 
 function capturePendingInvite() {
@@ -653,12 +937,35 @@ function capturePendingInvite() {
   state.pendingInvite = match && roomKey ? { token: match[1], roomKey } : null;
 }
 
+function syncNewChatMode() {
+  const kind = ui.inviteKindInput.value;
+  const structured = kind === "group" || kind === "channel";
+  ui.groupTitleLabel.classList.toggle("hidden", !structured);
+  ui.descriptionLabel.classList.toggle("hidden", !structured);
+  ui.inviteResult.classList.add("hidden");
+  ui.inviteLinkInput.value = "";
+
+  if (kind === "direct") {
+    ui.newChatHelp.dataset.i18n = "invitePrivacyHint";
+    ui.createChatButton.dataset.i18n = "createInvite";
+  } else if (kind === "group") {
+    ui.newChatHelp.dataset.i18n = "groupCreateHint";
+    ui.createChatButton.dataset.i18n = "createGroup";
+  } else {
+    ui.newChatHelp.dataset.i18n = "channelCreateHint";
+    ui.createChatButton.dataset.i18n = "createChannel";
+  }
+  applyTranslations();
+}
+
 async function createInvite() {
   ui.newChatError.textContent = "";
   ui.inviteResult.classList.add("hidden");
-  const kind = ui.inviteKindInput.value === "group" ? "group" : "direct";
+  const kind = ui.inviteKindInput.value;
   const title = ui.groupTitleInput.value.trim();
-  if (kind === "group" && !title) {
+  const description = ui.descriptionInput.value.trim();
+
+  if ((kind === "group" || kind === "channel") && !title) {
     ui.newChatError.textContent = t("groupNameRequired");
     return;
   }
@@ -666,18 +973,46 @@ async function createInvite() {
   ui.createChatButton.disabled = true;
   try {
     const roomKey = await generateRoomKey();
-    const exported = await exportRoomKey(roomKey);
-    const result = await api("/api/invites", {
+
+    if (kind === "direct") {
+      const exported = await exportRoomKey(roomKey);
+      const result = await api("/api/invites", {
+        method: "POST",
+        body: JSON.stringify({ kind: "direct" })
+      });
+      const link = `${location.origin}/invite/${result.token}#k=${encodeURIComponent(exported)}`;
+      ui.inviteLinkInput.value = link;
+      ui.inviteResult.classList.remove("hidden");
+      ui.createChatButton.dataset.i18n = "createAnotherInvite";
+      applyTranslations();
+      return;
+    }
+
+    const context = `create:${crypto.randomUUID()}`;
+    const wrapped = await wrapRoomKey(roomKey, state.privateKey, state.me.public_key_jwk, context);
+    const result = await api("/api/conversations", {
       method: "POST",
-      body: JSON.stringify({ kind, title: kind === "group" ? title : null })
+      body: JSON.stringify({
+        kind,
+        title,
+        description,
+        commentsEnabled: true,
+        selfEnvelope: {
+          iv: wrapped.iv,
+          ciphertext: JSON.stringify({ context, data: wrapped.ciphertext })
+        }
+      })
     });
-    const link = `${location.origin}/invite/${result.token}#k=${encodeURIComponent(exported)}`;
-    ui.inviteLinkInput.value = link;
-    ui.inviteResult.classList.remove("hidden");
-    ui.createChatButton.dataset.i18n = "createAnotherInvite";
-    applyTranslations();
+
+    state.roomKeys.set(result.conversation.id, roomKey);
+    ui.newChatModal.classList.add("hidden");
+    ui.groupTitleInput.value = "";
+    ui.descriptionInput.value = "";
+    await loadConversations();
+    await openConversation(result.conversation.id);
+    showToast(kind === "channel" ? t("newChannelCreated") : t("newGroupCreated"));
   } catch {
-    ui.newChatError.textContent = t("inviteCreateFailed");
+    ui.newChatError.textContent = kind === "direct" ? t("inviteCreateFailed") : t("chatCreateFailed");
   } finally {
     ui.createChatButton.disabled = false;
   }
@@ -732,6 +1067,260 @@ async function acceptPendingInvite() {
   }
 }
 
+function roleLabel(role) {
+  return t(role || "member");
+}
+
+async function createConversationInvite(conversation) {
+  if (!conversation || conversation.kind === "direct" || !canManageConversation(conversation)) {
+    throw new Error("forbidden");
+  }
+  const roomKey = await unlockConversationKey(conversation);
+  const exported = await exportRoomKey(roomKey);
+  const result = await api("/api/invites", {
+    method: "POST",
+    body: JSON.stringify({ conversationId: conversation.id, maxUses: 50 })
+  });
+  return `${location.origin}/invite/${result.token}#k=${encodeURIComponent(exported)}`;
+}
+
+async function renderChatInfo() {
+  const conversation = state.activeConversation;
+  if (!conversation) return;
+
+  ui.infoTitle.textContent = conversationName(conversation);
+  ui.infoSubtitle.textContent = conversationStatus(conversation);
+  ui.infoDescription.textContent = conversation.description || "";
+  ui.infoDescription.classList.toggle("hidden", !conversation.description);
+  ui.memberCount.textContent = String(conversation.members.length);
+  ui.infoInviteResult.classList.add("hidden");
+
+  const manageable = canManageConversation(conversation);
+  ui.shareInviteButton.classList.toggle("hidden", conversation.kind === "direct" || !manageable);
+  ui.editConversationButton.classList.toggle("hidden", conversation.kind === "direct" || !manageable);
+  ui.leaveConversationButton.classList.toggle("hidden", myRole(conversation) === "owner");
+
+  ui.muteConversationButton.dataset.i18n = conversation.notifications_enabled === false ? "unmuteChat" : "muteChat";
+  ui.toggleCommentsButton.classList.toggle("hidden", conversation.kind !== "channel" || !manageable);
+  ui.toggleCommentsButton.dataset.i18n = conversation.comments_enabled === false ? "enableComments" : "disableComments";
+  applyTranslations();
+
+  ui.memberList.replaceChildren();
+  for (const member of conversation.members) {
+    const row = document.createElement("div");
+    row.className = "member-row";
+
+    const avatar = document.createElement("div");
+    avatar.className = "avatar small";
+    avatar.textContent = firstLetter(member.displayName || member.display_name);
+
+    const meta = document.createElement("div");
+    meta.className = "member-meta";
+    const name = document.createElement("strong");
+    name.textContent = member.id === state.me.id
+      ? `${member.displayName || member.display_name} · ${t("you")}`
+      : (member.displayName || member.display_name);
+    const role = document.createElement("span");
+    role.textContent = roleLabel(member.role);
+    meta.append(name, role);
+    row.append(avatar, meta);
+
+    if (myRole(conversation) === "owner" && member.id !== state.me.id && member.role !== "owner") {
+      const roleButton = document.createElement("button");
+      roleButton.className = "mini-action";
+      roleButton.type = "button";
+      const admin = member.role === "admin";
+      roleButton.textContent = admin ? "−A" : "+A";
+      roleButton.title = admin ? t("removeAdmin") : t("makeAdmin");
+      roleButton.addEventListener("click", async () => {
+        const nextRole = admin
+          ? (conversation.kind === "channel" ? "subscriber" : "member")
+          : "admin";
+        await api(`/api/conversations/${conversation.id}/members/${member.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ role: nextRole })
+        });
+        await loadConversations();
+        await renderChatInfo();
+      });
+      row.appendChild(roleButton);
+    }
+
+    if (manageable && member.id !== state.me.id && member.role !== "owner") {
+      const remove = document.createElement("button");
+      remove.className = "mini-action danger";
+      remove.type = "button";
+      remove.textContent = "✕";
+      remove.title = t("removeMember");
+      remove.addEventListener("click", async () => {
+        await api(`/api/conversations/${conversation.id}/members/${member.id}`, { method: "DELETE" });
+        await loadConversations();
+        await renderChatInfo();
+      });
+      row.appendChild(remove);
+    }
+
+    ui.memberList.appendChild(row);
+  }
+}
+
+async function openChatInfo() {
+  if (!state.activeConversation) return;
+  await renderChatInfo();
+  ui.chatInfoModal.classList.remove("hidden");
+}
+
+async function shareCurrentConversation() {
+  const link = await createConversationInvite(state.activeConversation);
+  ui.infoInviteLink.value = link;
+  ui.infoInviteResult.classList.remove("hidden");
+}
+
+async function editCurrentConversation() {
+  const conversation = state.activeConversation;
+  if (!conversation || !canManageConversation(conversation)) return;
+
+  const title = window.prompt(t("groupName"), conversation.title || "");
+  if (title === null) return;
+  const description = window.prompt(t("description"), conversation.description || "");
+  if (description === null) return;
+
+  await api(`/api/conversations/${conversation.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      title,
+      description,
+      commentsEnabled: conversation.comments_enabled !== false
+    })
+  });
+  await loadConversations();
+  updateChatHeader();
+  await renderChatInfo();
+}
+
+async function toggleConversationNotifications() {
+  const conversation = state.activeConversation;
+  if (!conversation) return;
+  const enabled = conversation.notifications_enabled === false;
+  await api(`/api/conversations/${conversation.id}/settings`, {
+    method: "PATCH",
+    body: JSON.stringify({ notificationsEnabled: enabled })
+  });
+  conversation.notifications_enabled = enabled;
+  await renderChatInfo();
+}
+
+async function toggleChannelComments() {
+  const conversation = state.activeConversation;
+  if (!conversation || conversation.kind !== "channel" || !canManageConversation(conversation)) return;
+  const enabled = conversation.comments_enabled === false;
+  await api(`/api/conversations/${conversation.id}`, {
+    method: "PATCH",
+    body: JSON.stringify({ commentsEnabled: enabled })
+  });
+  await loadConversations();
+  updateChatHeader();
+  await renderChatInfo();
+  await loadMessages();
+}
+
+async function requestBrowserNotifications() {
+  if (!("Notification" in window)) return;
+  const permission = await Notification.requestPermission();
+  if (permission === "granted") {
+    ui.enableNotificationsButton.dataset.i18n = "notificationsEnabled";
+    applyTranslations();
+  }
+}
+
+function maybeNotifyIncoming(conversation, message) {
+  if (!conversation || message.sender_id === state.me.id || conversation.notifications_enabled === false) return;
+  if (!document.hidden || !("Notification" in window) || Notification.permission !== "granted") return;
+  const notification = new Notification(conversationName(conversation), {
+    body: t("newMessageNotification"),
+    icon: "/icon.svg",
+    tag: `m0d-${conversation.id}`
+  });
+  notification.onclick = () => {
+    window.focus();
+    openConversation(conversation.id).catch(() => {});
+    notification.close();
+  };
+}
+
+async function leaveCurrentConversation() {
+  const conversation = state.activeConversation;
+  if (!conversation || myRole(conversation) === "owner") return;
+  await api(`/api/conversations/${conversation.id}/members/me`, { method: "DELETE" });
+  ui.chatInfoModal.classList.add("hidden");
+  state.activeConversation = null;
+  ui.activeChat.classList.add("hidden");
+  ui.emptyChat.classList.remove("hidden");
+  ui.chatPane.classList.add("empty");
+  ui.appView.classList.remove("chat-open");
+  await loadConversations();
+}
+
+async function openThread(message, body) {
+  const conversation = state.activeConversation;
+  if (!conversation || conversation.kind !== "channel" || conversation.comments_enabled === false) return;
+  state.threadRoot = message;
+  state.threadReplyTo = null;
+  state.threadEditingMessage = null;
+  ui.threadSubtitle.textContent = body?.text?.slice(0, 100) || `#${message.id}`;
+  ui.threadInput.value = "";
+  ui.threadModal.classList.remove("hidden");
+  await loadThreadMessages();
+}
+
+async function loadThreadMessages() {
+  const conversation = state.activeConversation;
+  const root = state.threadRoot;
+  if (!conversation || !root) return;
+  const roomKey = await unlockConversationKey(conversation);
+  const result = await api(`/api/conversations/${conversation.id}/messages?threadRootId=${root.id}&limit=100`);
+  ui.threadMessageList.replaceChildren();
+  for (const message of result.messages || []) {
+    await appendMessage(message, roomKey, ui.threadMessageList, true);
+  }
+  const last = result.messages?.[result.messages.length - 1];
+  if (last) await markConversationRead(last.id);
+  ui.threadMessageList.scrollTop = ui.threadMessageList.scrollHeight;
+}
+
+async function sendThreadComment() {
+  const conversation = state.activeConversation;
+  const root = state.threadRoot;
+  const text = ui.threadInput.value.trim();
+  if (!conversation || !root || !text) return;
+
+  const roomKey = await unlockConversationKey(conversation);
+  const encrypted = await encryptJson(roomKey, { version: 1, text });
+  if (state.threadEditingMessage) {
+    await api(`/api/conversations/${conversation.id}/messages/${state.threadEditingMessage.id}`, {
+      method: "PATCH",
+      body: JSON.stringify(encrypted)
+    });
+  } else {
+    await api(`/api/conversations/${conversation.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({
+        ...encrypted,
+        threadRootId: root.id,
+        replyToId: state.threadReplyTo?.id || null
+      })
+    });
+  }
+
+  state.threadEditingMessage = null;
+  state.threadReplyTo = null;
+  ui.threadInput.value = "";
+  ui.threadSubtitle.textContent = state.messageCache.get(Number(root.id))?.body?.text?.slice(0, 100) || `#${root.id}`;
+  await loadThreadMessages();
+  await loadMessages();
+  await loadConversations();
+}
+
 function connectSocket() {
   if (state.ws && state.ws.readyState <= 1) return;
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
@@ -756,16 +1345,71 @@ function connectSocket() {
 
     if (message.type === "message") {
       const incoming = message.message;
+      const sourceConversation = state.conversations.find(c => c.id === incoming.conversation_id);
+      maybeNotifyIncoming(sourceConversation, incoming);
       if (state.activeConversation?.id === incoming.conversation_id) {
         const roomKey = await unlockConversationKey(state.activeConversation);
-        await appendMessage(incoming, roomKey);
-        ui.messageList.scrollTop = ui.messageList.scrollHeight;
+        if (incoming.thread_root_id) {
+          if (state.threadRoot?.id === incoming.thread_root_id && !ui.threadModal.classList.contains("hidden")) {
+            await appendMessage(incoming, roomKey, ui.threadMessageList, true);
+            ui.threadMessageList.scrollTop = ui.threadMessageList.scrollHeight;
+          }
+          await loadMessages();
+        } else {
+          await appendMessage(incoming, roomKey);
+          ui.messageList.scrollTop = ui.messageList.scrollHeight;
+          await markConversationRead(incoming.id);
+        }
       }
       await loadConversations();
       return;
     }
 
-    if (message.type === "conversation-created") {
+    if (message.type === "typing") {
+      if (state.activeConversation?.id === message.conversationId && message.userId !== state.me.id) {
+        clearTimeout(state.remoteTypingTimer);
+        ui.chatStatus.textContent = message.typing ? t("typing") : conversationStatus(state.activeConversation);
+        if (message.typing) {
+          state.remoteTypingTimer = setTimeout(() => updateChatHeader(), 2600);
+        }
+      }
+      return;
+    }
+
+    if (message.type === "read") {
+      const conversation = state.conversations.find(c => c.id === message.conversationId);
+      const member = conversation?.members?.find(item => item.id === message.userId);
+      if (member) member.lastReadMessageId = Math.max(Number(member.lastReadMessageId || 0), Number(message.messageId || 0));
+      if (state.activeConversation?.id === message.conversationId && state.activeConversation.kind === "direct") {
+        await loadMessages();
+      }
+      return;
+    }
+
+    if (["message-updated", "message-deleted", "message-reactions", "message-pinned"].includes(message.type)) {
+      if (state.activeConversation?.id === message.conversationId || state.activeConversation?.id === message.message?.conversation_id) {
+        await loadMessages();
+        if (state.threadRoot && !ui.threadModal.classList.contains("hidden")) await loadThreadMessages();
+      }
+      await loadConversations();
+      return;
+    }
+
+    if (["conversation-created", "conversation-updated", "member-role", "member-removed"].includes(message.type)) {
+      await loadConversations();
+      updateChatHeader();
+      if (!ui.chatInfoModal.classList.contains("hidden")) await renderChatInfo();
+      return;
+    }
+
+    if (message.type === "conversation-removed") {
+      if (state.activeConversation?.id === message.conversationId) {
+        state.activeConversation = null;
+        ui.activeChat.classList.add("hidden");
+        ui.emptyChat.classList.remove("hidden");
+        ui.chatPane.classList.add("empty");
+        ui.appView.classList.remove("chat-open");
+      }
       await loadConversations();
       return;
     }
@@ -782,6 +1426,23 @@ function sendSignal(payload) {
   if (state.ws?.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify(payload));
   }
+}
+
+function sendTyping(typing, threadRootId = null) {
+  const conversation = state.activeConversation;
+  if (!conversation || state.ws?.readyState !== WebSocket.OPEN) return;
+  state.ws.send(JSON.stringify({
+    type: "typing",
+    conversationId: conversation.id,
+    typing: Boolean(typing),
+    threadRootId
+  }));
+}
+
+function pulseTyping(threadRootId = null) {
+  sendTyping(true, threadRootId);
+  clearTimeout(state.typingTimer);
+  state.typingTimer = setTimeout(() => sendTyping(false, threadRootId), 1500);
 }
 
 function showCallOverlay(name) {
@@ -1246,6 +1907,10 @@ async function enterMessenger() {
   ui.meName.textContent = state.me.display_name;
   ui.meEmail.textContent = state.me.email;
   ui.meAvatar.textContent = firstLetter(state.me.display_name);
+  if ("Notification" in window && Notification.permission === "granted") {
+    ui.enableNotificationsButton.dataset.i18n = "notificationsEnabled";
+    applyTranslations();
+  }
   state.roomKeys.clear();
   await loadConversations();
   connectSocket();
@@ -1299,16 +1964,14 @@ ui.newChatButton.addEventListener("click", () => {
   ui.newChatError.textContent = "";
   ui.inviteResult.classList.add("hidden");
   ui.inviteLinkInput.value = "";
-  ui.createChatButton.dataset.i18n = "createInvite";
-  applyTranslations();
+  ui.groupTitleInput.value = "";
+  ui.descriptionInput.value = "";
+  syncNewChatMode();
   ui.newChatModal.classList.remove("hidden");
   setTimeout(() => ui.inviteKindInput.focus(), 50);
 });
 ui.closeNewChatButton.addEventListener("click", () => ui.newChatModal.classList.add("hidden"));
-ui.inviteKindInput.addEventListener("change", () => {
-  const group = ui.inviteKindInput.value === "group";
-  ui.groupTitleLabel.classList.toggle("hidden", !group);
-});
+ui.inviteKindInput.addEventListener("change", syncNewChatMode);
 ui.copyInviteButton.addEventListener("click", async () => {
   if (!ui.inviteLinkInput.value) return;
   await navigator.clipboard.writeText(ui.inviteLinkInput.value);
@@ -1322,12 +1985,56 @@ ui.newChatModal.addEventListener("click", event => {
 ui.menuButton.addEventListener("click", openDrawer);
 ui.closeDrawerButton.addEventListener("click", closeDrawer);
 ui.drawerBackdrop.addEventListener("click", closeDrawer);
+ui.enableNotificationsButton.addEventListener("click", () => requestBrowserNotifications().catch(() => {}));
 ui.logoutButton.addEventListener("click", logout);
+
+ui.muteConversationButton.addEventListener("click", () => toggleConversationNotifications().catch(() => showToast(t("serverError"))));
+ui.toggleCommentsButton.addEventListener("click", () => toggleChannelComments().catch(() => showToast(t("serverError"))));
 
 ui.chatSearch.addEventListener("input", renderConversationList);
 ui.backButton.addEventListener("click", () => ui.appView.classList.remove("chat-open"));
+ui.chatInfoButton.addEventListener("click", () => openChatInfo().catch(() => showToast(t("serverError"))));
+ui.closeChatInfoButton.addEventListener("click", () => ui.chatInfoModal.classList.add("hidden"));
+ui.chatInfoModal.addEventListener("click", event => {
+  if (event.target === ui.chatInfoModal) ui.chatInfoModal.classList.add("hidden");
+});
+ui.shareInviteButton.addEventListener("click", () => shareCurrentConversation().catch(() => showToast(t("serverError"))));
+ui.copyInfoInviteButton.addEventListener("click", async () => {
+  if (!ui.infoInviteLink.value) return;
+  await navigator.clipboard.writeText(ui.infoInviteLink.value);
+  showToast(t("linkCopied"));
+});
+ui.editConversationButton.addEventListener("click", () => editCurrentConversation().catch(() => showToast(t("serverError"))));
+ui.leaveConversationButton.addEventListener("click", () => leaveCurrentConversation().catch(() => showToast(t("serverError"))));
 
-ui.messageInput.addEventListener("input", autosizeComposer);
+ui.cancelComposerContext.addEventListener("click", () => {
+  clearComposerContext();
+  ui.messageInput.value = "";
+  autosizeComposer();
+});
+
+ui.closeThreadButton.addEventListener("click", () => {
+  ui.threadModal.classList.add("hidden");
+  state.threadRoot = null;
+  state.threadReplyTo = null;
+  state.threadEditingMessage = null;
+});
+ui.threadModal.addEventListener("click", event => {
+  if (event.target === ui.threadModal) ui.closeThreadButton.click();
+});
+ui.threadSendButton.addEventListener("click", () => sendThreadComment().catch(() => showToast(t("serverError"))));
+ui.threadInput.addEventListener("input", () => pulseTyping(state.threadRoot?.id || null));
+ui.threadInput.addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    sendThreadComment().catch(() => showToast(t("serverError")));
+  }
+});
+
+ui.messageInput.addEventListener("input", () => {
+  autosizeComposer();
+  pulseTyping();
+});
 ui.messageInput.addEventListener("keydown", event => {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();

@@ -11,7 +11,16 @@ M0D — открытый мессенджер для обычного общен
 - регистрация по email с обязательным кодом подтверждения;
 - вход по email и паролю;
 - email является приватной информацией и **не используется для поиска людей**;
-- личные чаты и группы через ссылки-приглашения;
+- личные чаты через приватные ссылки-приглашения;
+- группы создаются сразу, а новых участников можно добавлять инвайт-ссылкой;
+- каналы с владельцем, администраторами и подписчиками;
+- посты каналов и комментарии отдельным тредом, как в Telegram;
+- ответы на сообщения, редактирование и удаление;
+- реакции и закреплённые сообщения;
+- непрочитанные сообщения, статус прочтения в личных чатах и индикатор набора текста;
+- роли владельца/администратора и управление участниками;
+- отключение уведомлений для отдельного чата и переключатель комментариев канала;
+- фоновые браузерные уведомления, пока веб-клиент/PWA запущен;
 - если человек ещё не зарегистрирован, инвайт переживает регистрацию и после входа сразу открывает нужный чат;
 - сообщения в реальном времени через WebSocket;
 - клиентское шифрование текста и вложений;
@@ -22,7 +31,7 @@ M0D — открытый мессенджер для обычного общен
 - PWA для установки сайта на телефон и ПК;
 - интерфейс на русском, английском и украинском.
 
-Временный адрес проекта: `https://call.mask-0f-darkness.ru`.
+Текущий тестовый стенд M0D: `https://m0d-dev.mask-0f-darkness.ru`. Стабильная звонилка на `call.mask-0f-darkness.ru` развёрнута отдельно и не используется для разработки M0D.
 ## Приватность инвайтов
 
 M0D не просит email другого человека для начала диалога.
@@ -35,7 +44,7 @@ https://example.org/invite/<token>#k=<room-key>
 
 Токен приглашения проверяется сервером. Секрет ключа комнаты находится после символа `#`; браузер не отправляет URL fragment серверу при HTTP-запросе.
 
-Для личного диалога инвайт одноразовый. Для группы ссылка может иметь несколько использований и ограниченный срок жизни.
+Для личного диалога инвайт одноразовый. Группа или канал создаются владельцем сразу, после чего владелец/администратор может выпустить многоразовую инвайт-ссылку с ограниченным сроком жизни.
 
 **Важно:** полная инвайт-ссылка является секретом. Человек, получивший её целиком, получает возможность присоединиться к чату в рамках ограничений инвайта.
 
@@ -158,7 +167,16 @@ The interface follows a familiar Telegram-like workflow: chat list, conversation
 - email registration with mandatory verification code;
 - email + password login;
 - email is private account data and is **not used for user discovery**;
-- direct chats and groups created through invitation links;
+- direct chats created through private invitation links;
+- groups created immediately, with invite links for adding members later;
+- channels with owner, admin and subscriber roles;
+- channel posts with threaded comments;
+- replies, message editing and deletion;
+- reactions and pinned messages;
+- unread counters, direct-chat read receipts and typing indicators;
+- member moderation and admin role management;
+- per-chat mute and channel comment controls;
+- background browser notifications while the web client/PWA is running;
 - an invitation survives registration and opens the target chat after login;
 - real-time messaging over WebSocket;
 - client-side encrypted message bodies and attachments;
@@ -169,7 +187,7 @@ The interface follows a familiar Telegram-like workflow: chat list, conversation
 - installable PWA;
 - Russian, English and Ukrainian UI.
 
-Temporary deployment: `https://call.mask-0f-darkness.ru`.
+Current M0D development deployment: `https://m0d-dev.mask-0f-darkness.ru`. The stable private-call service at `call.mask-0f-darkness.ru` is deployed separately and is not used for M0D development.
 
 ## Invitation privacy
 
@@ -183,7 +201,7 @@ https://example.org/invite/<token>#k=<room-key>
 
 The server validates the invitation token. The room-key secret is stored in the URL fragment after `#`; browsers do not send that fragment to the HTTP server.
 
-A direct-chat invite is single-use. Group invites can allow multiple uses and expire.
+A direct-chat invite is single-use. Groups and channels are created immediately by their owner; owners/admins can then issue multi-use invitation links that expire.
 
 The full invitation URL is sensitive: anyone who obtains it may be able to join while the invitation remains valid.
 

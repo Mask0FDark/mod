@@ -125,3 +125,84 @@ CREATE INDEX IF NOT EXISTS idx_members_user
 
 CREATE INDEX IF NOT EXISTS idx_sessions_expiry
   ON sessions(expires_at);
+
+
+-- Core messenger features: channels, roles, threads, reactions, pins and read state.
+ALTER TABLE conversations DROP CONSTRAINT IF EXISTS conversations_kind_check;
+ALTER TABLE conversations
+  ADD CONSTRAINT conversations_kind_check CHECK (kind IN ('direct','group','channel'));
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS description text;
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS comments_enabled boolean NOT NULL DEFAULT true;
+
+ALTER TABLE conversation_invites DROP CONSTRAINT IF EXISTS conversation_invites_kind_check;
+ALTER TABLE conversation_invites
+  ADD CONSTRAINT conversation_invites_kind_check CHECK (kind IN ('direct','group','channel'));
+
+ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS role text NOT NULL DEFAULT 'member';
+ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS last_read_message_id bigint NOT NULL DEFAULT 0;
+ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS notifications_enabled boolean NOT NULL DEFAULT true;
+ALTER TABLE conversation_members DROP CONSTRAINT IF EXISTS conversation_members_role_check;
+ALTER TABLE conversation_members
+  ADD CONSTRAINT conversation_members_role_check CHECK (role IN ('owner','admin','member','subscriber'));
+
+UPDATE conversation_members cm
+SET role='owner'
+FROM conversations c
+WHERE cm.conversation_id=c.id
+  AND cm.user_id=c.created_by
+  AND cm.role<>'owner';
+
+UPDATE conversation_members cm
+SET role='subscriber'
+FROM conversations c
+WHERE cm.conversation_id=c.id
+  AND c.kind='channel'
+  AND cm.role='member';
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_id bigint;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS thread_root_id bigint;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at timestamptz;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname='messages_reply_to_id_fkey'
+  ) THEN
+    ALTER TABLE messages
+      ADD CONSTRAINT messages_reply_to_id_fkey
+      FOREIGN KEY (reply_to_id) REFERENCES messages(id) ON DELETE SET NULL;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname='messages_thread_root_id_fkey'
+  ) THEN
+    ALTER TABLE messages
+      ADD CONSTRAINT messages_thread_root_id_fkey
+      FOREIGN KEY (thread_root_id) REFERENCES messages(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS message_reactions (
+  message_id bigint NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  emoji text NOT NULL CHECK (char_length(emoji) BETWEEN 1 AND 16),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (message_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS conversation_pins (
+  conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  message_id bigint NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  pinned_by uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  pinned_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (conversation_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_thread_root
+  ON messages(conversation_id, thread_root_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_reply_to
+  ON messages(reply_to_id);
+CREATE INDEX IF NOT EXISTS idx_reactions_message
+  ON message_reactions(message_id);
+CREATE INDEX IF NOT EXISTS idx_pins_conversation
+  ON conversation_pins(conversation_id, pinned_at DESC);

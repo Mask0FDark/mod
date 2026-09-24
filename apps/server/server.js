@@ -174,6 +174,33 @@ async function memberIds(conversationId) {
   return result.rows.map(row => row.user_id);
 }
 
+async function membership(userId, conversationId) {
+  const result = await db.query(
+    `SELECT cm.role,cm.last_read_message_id,cm.notifications_enabled,
+            c.kind,c.created_by,c.comments_enabled,c.title,c.description
+     FROM conversation_members cm
+     JOIN conversations c ON c.id=cm.conversation_id
+     WHERE cm.user_id=$1 AND cm.conversation_id=$2`,
+    [userId, conversationId]
+  );
+  return result.rows[0] || null;
+}
+
+function canManage(member) {
+  return Boolean(member && ["owner", "admin"].includes(member.role));
+}
+
+async function messageDetails(messageId, conversationId) {
+  const result = await db.query(
+    `SELECT m.*,u.display_name AS sender_name
+     FROM messages m
+     JOIN users u ON u.id=m.sender_id
+     WHERE m.id=$1 AND m.conversation_id=$2`,
+    [messageId, conversationId]
+  );
+  return result.rows[0] || null;
+}
+
 function emitToUser(userId, payload) {
   for (const ws of socketsByUser.get(userId) || []) {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
@@ -372,24 +399,78 @@ app.get("/api/me", auth, (req, res) => {
   res.json({ user: req.user });
 });
 
+app.post("/api/conversations", auth, async (req, res, next) => {
+  const client = await db.connect();
+  try {
+    const kind = req.body?.kind === "channel" ? "channel" : "group";
+    const title = cleanName(req.body?.title);
+    const description = String(req.body?.description || "").trim().slice(0, 500);
+    const commentsEnabled = req.body?.commentsEnabled !== false;
+    const selfEnvelope = req.body?.selfEnvelope;
+
+    if (!title) return res.status(400).json({ error: "title_required" });
+    if (!selfEnvelope?.iv || !selfEnvelope?.ciphertext) {
+      return res.status(400).json({ error: "missing_key_envelope" });
+    }
+
+    await client.query("BEGIN");
+    const created = await client.query(
+      `INSERT INTO conversations(kind,title,description,comments_enabled,created_by)
+       VALUES($1,$2,$3,$4,$5)
+       RETURNING id,kind,title,description,comments_enabled,created_by,created_at`,
+      [kind, title, description || null, commentsEnabled, req.user.id]
+    );
+    const conversation = created.rows[0];
+    await client.query(
+      `INSERT INTO conversation_members(conversation_id,user_id,role)
+       VALUES($1,$2,'owner')`,
+      [conversation.id, req.user.id]
+    );
+    await client.query(
+      `INSERT INTO conversation_keys(conversation_id,user_id,wrapped_by_user_id,iv,ciphertext)
+       VALUES($1,$2,$2,$3,$4)`,
+      [conversation.id, req.user.id, selfEnvelope.iv, selfEnvelope.ciphertext]
+    );
+    await client.query("COMMIT");
+    res.status(201).json({ conversation });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(err);
+  } finally {
+    client.release();
+  }
+});
+
 app.post("/api/invites", auth, async (req, res, next) => {
   try {
-    const kind = req.body?.kind === "group" ? "group" : "direct";
-    const title = kind === "group" ? cleanName(req.body?.title) : null;
-    if (kind === "group" && !title) return res.status(400).json({ error: "title_required" });
-    if (!rateLimit(`invite:${req.user.id}`, 20, 60 * 60_000)) {
+    if (!rateLimit(`invite:${req.user.id}`, 30, 60 * 60_000)) {
       return res.status(429).json({ error: "too_many_attempts" });
+    }
+
+    let kind = "direct";
+    let title = null;
+    let conversationId = null;
+    const requestedConversationId = req.body?.conversationId ? String(req.body.conversationId) : null;
+
+    if (requestedConversationId) {
+      const member = await membership(req.user.id, requestedConversationId);
+      if (!member || !canManage(member) || !["group", "channel"].includes(member.kind)) {
+        return res.status(403).json({ error: "forbidden" });
+      }
+      conversationId = requestedConversationId;
+      kind = member.kind;
+      title = member.title;
     }
 
     const token = crypto.randomBytes(32).toString("base64url");
     const maxUses = kind === "direct"
       ? 1
-      : Math.min(Math.max(Number(req.body?.maxUses || 20), 1), 50);
+      : Math.min(Math.max(Number(req.body?.maxUses || 50), 1), 50);
     const result = await db.query(
-      `INSERT INTO conversation_invites(token_hash,kind,title,created_by,max_uses,expires_at)
-       VALUES($1,$2,$3,$4,$5,now()+($6 || ' hours')::interval)
-       RETURNING id,kind,title,max_uses,use_count,expires_at`,
-      [tokenHash(token), kind, title, req.user.id, maxUses, String(INVITE_TTL_HOURS)]
+      `INSERT INTO conversation_invites(token_hash,kind,title,created_by,conversation_id,max_uses,expires_at)
+       VALUES($1,$2,$3,$4,$5,$6,now()+($7 || ' hours')::interval)
+       RETURNING id,kind,title,conversation_id,max_uses,use_count,expires_at`,
+      [tokenHash(token), kind, title, req.user.id, conversationId, maxUses, String(INVITE_TTL_HOURS)]
     );
     res.status(201).json({ token, invite: result.rows[0] });
   } catch (err) {
@@ -439,18 +520,18 @@ app.post("/api/invites/:token/accept", auth, async (req, res, next) => {
 
     let conversationId = invite.conversation_id;
     if (!conversationId) {
-      if (!creatorEnvelope?.iv || !creatorEnvelope?.ciphertext) {
+      if (invite.kind !== "direct" || !creatorEnvelope?.iv || !creatorEnvelope?.ciphertext) {
         await client.query("ROLLBACK");
-        return res.status(400).json({ error: "missing_creator_envelope" });
+        return res.status(400).json({ error: "invite_invalid" });
       }
       const created = await client.query(
-        "INSERT INTO conversations(kind,title,created_by) VALUES($1,$2,$3) RETURNING id",
-        [invite.kind, invite.title, invite.created_by]
+        "INSERT INTO conversations(kind,title,created_by) VALUES('direct',NULL,$1) RETURNING id",
+        [invite.created_by]
       );
       conversationId = created.rows[0].id;
       for (const userId of [invite.created_by, req.user.id]) {
         await client.query(
-          "INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2)",
+          "INSERT INTO conversation_members(conversation_id,user_id,role) VALUES($1,$2,'member')",
           [conversationId, userId]
         );
       }
@@ -464,13 +545,15 @@ app.post("/api/invites/:token/accept", auth, async (req, res, next) => {
         ]
       );
     } else {
-      if (invite.kind !== "group") {
+      if (!["group", "channel"].includes(invite.kind)) {
         await client.query("ROLLBACK");
         return res.status(404).json({ error: "invite_invalid" });
       }
+      const joinedRole = invite.kind === "channel" ? "subscriber" : "member";
       await client.query(
-        "INSERT INTO conversation_members(conversation_id,user_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
-        [conversationId, req.user.id]
+        `INSERT INTO conversation_members(conversation_id,user_id,role)
+         VALUES($1,$2,$3) ON CONFLICT DO NOTHING`,
+        [conversationId, req.user.id, joinedRole]
       );
       await client.query(
         `INSERT INTO conversation_keys(conversation_id,user_id,wrapped_by_user_id,iv,ciphertext)
@@ -499,13 +582,20 @@ app.post("/api/invites/:token/accept", auth, async (req, res, next) => {
 app.get("/api/conversations", auth, async (req, res, next) => {
   try {
     const result = await db.query(
-      `SELECT c.id,c.kind,c.title,c.created_by,c.created_at,
+      `SELECT c.id,c.kind,c.title,c.description,c.comments_enabled,c.created_by,c.created_at,
+              mine.role AS my_role,mine.last_read_message_id,mine.notifications_enabled,
               ck.iv AS key_iv,ck.ciphertext AS key_ciphertext,ck.wrapped_by_user_id,
               COALESCE(json_agg(json_build_object(
-                'id',u.id,'displayName',u.display_name,'publicKeyJwk',u.public_key_jwk
-              ) ORDER BY u.display_name) FILTER (WHERE u.id IS NOT NULL),'[]') AS members,
+                'id',u.id,'displayName',u.display_name,'publicKeyJwk',u.public_key_jwk,
+                'role',cm.role,'lastReadMessageId',cm.last_read_message_id
+              ) ORDER BY
+                CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+                u.display_name
+              ) FILTER (WHERE u.id IS NOT NULL),'[]') AS members,
               lm.id AS last_message_id,lm.sender_id AS last_sender_id,
-              lm.ciphertext AS last_ciphertext,lm.iv AS last_iv,lm.created_at AS last_message_at
+              lm.ciphertext AS last_ciphertext,lm.iv AS last_iv,lm.created_at AS last_message_at,
+              COALESCE(unread.unread_count,0)::int AS unread_count,
+              COALESCE(pins.pinned_count,0)::int AS pinned_count
        FROM conversations c
        JOIN conversation_members mine ON mine.conversation_id=c.id AND mine.user_id=$1
        JOIN conversation_keys ck ON ck.conversation_id=c.id AND ck.user_id=$1
@@ -517,8 +607,23 @@ app.get("/api/conversations", auth, async (req, res, next) => {
          WHERE conversation_id=c.id
          ORDER BY id DESC LIMIT 1
        ) lm ON true
-       GROUP BY c.id,ck.iv,ck.ciphertext,ck.wrapped_by_user_id,
-                lm.id,lm.sender_id,lm.ciphertext,lm.iv,lm.created_at
+       LEFT JOIN LATERAL (
+         SELECT count(*) AS unread_count
+         FROM messages um
+         WHERE um.conversation_id=c.id
+           AND um.id>mine.last_read_message_id
+           AND um.sender_id<>$1
+           AND um.deleted_at IS NULL
+       ) unread ON true
+       LEFT JOIN LATERAL (
+         SELECT count(*) AS pinned_count
+         FROM conversation_pins p
+         WHERE p.conversation_id=c.id
+       ) pins ON true
+       GROUP BY c.id,mine.role,mine.last_read_message_id,mine.notifications_enabled,
+                ck.iv,ck.ciphertext,ck.wrapped_by_user_id,
+                lm.id,lm.sender_id,lm.ciphertext,lm.iv,lm.created_at,
+                unread.unread_count,pins.pinned_count
        ORDER BY COALESCE(lm.created_at,c.created_at) DESC`,
       [req.user.id]
     );
@@ -528,22 +633,203 @@ app.get("/api/conversations", auth, async (req, res, next) => {
   }
 });
 
-app.get("/api/conversations/:id/messages", auth, async (req, res, next) => {
+app.patch("/api/conversations/:id", auth, async (req, res, next) => {
   try {
-    if (!(await isMember(req.user.id, req.params.id))) {
+    const conversationId = req.params.id;
+    const member = await membership(req.user.id, conversationId);
+    if (!canManage(member)) return res.status(403).json({ error: "forbidden" });
+
+    const title = req.body?.title !== undefined ? cleanName(req.body.title) : undefined;
+    const description = req.body?.description !== undefined
+      ? String(req.body.description || "").trim().slice(0, 500)
+      : undefined;
+    const commentsEnabled = req.body?.commentsEnabled;
+
+    if (title !== undefined && !title && member.kind !== "direct") {
+      return res.status(400).json({ error: "title_required" });
+    }
+
+    const result = await db.query(
+      `UPDATE conversations
+       SET title=COALESCE($2,title),
+           description=CASE WHEN $3::boolean THEN $4 ELSE description END,
+           comments_enabled=COALESCE($5,comments_enabled)
+       WHERE id=$1
+       RETURNING id,kind,title,description,comments_enabled,created_by,created_at`,
+      [
+        conversationId,
+        title === undefined ? null : title,
+        description !== undefined,
+        description === undefined ? null : description || null,
+        commentsEnabled === undefined ? null : Boolean(commentsEnabled)
+      ]
+    );
+    await emitConversation(conversationId, { type: "conversation-updated", conversation: result.rows[0] });
+    res.json({ conversation: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.patch("/api/conversations/:id/settings", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    if (!(await isMember(req.user.id, conversationId))) {
       return res.status(403).json({ error: "forbidden" });
     }
+    if (req.body?.notificationsEnabled === undefined) {
+      return res.status(400).json({ error: "invalid_settings" });
+    }
+    const result = await db.query(
+      `UPDATE conversation_members
+       SET notifications_enabled=$3
+       WHERE conversation_id=$1 AND user_id=$2
+       RETURNING notifications_enabled`,
+      [conversationId, req.user.id, Boolean(req.body.notificationsEnabled)]
+    );
+    res.json({ settings: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.patch("/api/conversations/:id/members/:userId", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const targetUserId = req.params.userId;
+    const member = await membership(req.user.id, conversationId);
+    if (!member || member.role !== "owner") return res.status(403).json({ error: "owner_required" });
+    if (targetUserId === req.user.id) return res.status(400).json({ error: "cannot_change_owner" });
+
+    const role = String(req.body?.role || "");
+    const allowed = member.kind === "channel" ? ["admin", "subscriber"] : ["admin", "member"];
+    if (!allowed.includes(role)) return res.status(400).json({ error: "invalid_role" });
+
+    const result = await db.query(
+      `UPDATE conversation_members SET role=$3
+       WHERE conversation_id=$1 AND user_id=$2 AND role<>'owner'
+       RETURNING user_id,role`,
+      [conversationId, targetUserId, role]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: "not_found" });
+    await emitConversation(conversationId, { type: "member-role", conversationId, userId: targetUserId, role });
+    res.json({ member: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete("/api/conversations/:id/members/:userId", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const targetUserId = req.params.userId;
+    const member = await membership(req.user.id, conversationId);
+
+    if (targetUserId === "me") {
+      if (!member) return res.status(404).json({ error: "not_found" });
+      if (member.role === "owner") return res.status(409).json({ error: "owner_cannot_leave" });
+      await db.query("DELETE FROM conversation_keys WHERE conversation_id=$1 AND user_id=$2", [conversationId, req.user.id]);
+      await db.query("DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2", [conversationId, req.user.id]);
+      return res.json({ ok: true });
+    }
+
+    if (!canManage(member)) return res.status(403).json({ error: "forbidden" });
+
+    const target = await membership(targetUserId, conversationId);
+    if (!target) return res.status(404).json({ error: "not_found" });
+    if (target.role === "owner") return res.status(400).json({ error: "cannot_remove_owner" });
+    if (member.role === "admin" && target.role === "admin") {
+      return res.status(403).json({ error: "owner_required" });
+    }
+
+    await db.query("DELETE FROM conversation_keys WHERE conversation_id=$1 AND user_id=$2", [conversationId, targetUserId]);
+    await db.query("DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2", [conversationId, targetUserId]);
+    emitToUser(targetUserId, { type: "conversation-removed", conversationId });
+    await emitConversation(conversationId, { type: "member-removed", conversationId, userId: targetUserId });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete("/api/conversations/:id/members/me", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const member = await membership(req.user.id, conversationId);
+    if (!member) return res.status(404).json({ error: "not_found" });
+    if (member.role === "owner") return res.status(409).json({ error: "owner_cannot_leave" });
+
+    await db.query("DELETE FROM conversation_keys WHERE conversation_id=$1 AND user_id=$2", [conversationId, req.user.id]);
+    await db.query("DELETE FROM conversation_members WHERE conversation_id=$1 AND user_id=$2", [conversationId, req.user.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get("/api/conversations/:id/pins", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    if (!(await isMember(req.user.id, conversationId))) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    const result = await db.query(
+      `SELECT m.id,m.conversation_id,m.sender_id,m.ciphertext,m.iv,m.attachment_id,
+              m.reply_to_id,m.thread_root_id,m.edited_at,m.deleted_at,m.created_at,
+              u.display_name AS sender_name,p.pinned_at
+       FROM conversation_pins p
+       JOIN messages m ON m.id=p.message_id
+       JOIN users u ON u.id=m.sender_id
+       WHERE p.conversation_id=$1
+       ORDER BY p.pinned_at DESC LIMIT 50`,
+      [conversationId]
+    );
+    res.json({ messages: result.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get("/api/conversations/:id/messages", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const member = await membership(req.user.id, conversationId);
+    if (!member) return res.status(403).json({ error: "forbidden" });
 
     const before = Number(req.query.before || Number.MAX_SAFE_INTEGER);
     const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
+    const requestedThread = req.query.threadRootId ? Number(req.query.threadRootId) : null;
+    const threadClause = member.kind === "channel"
+      ? (requestedThread ? "AND m.thread_root_id=$4" : "AND m.thread_root_id IS NULL")
+      : "AND m.thread_root_id IS NULL";
+    const params = requestedThread
+      ? [conversationId, before, limit, requestedThread]
+      : [conversationId, before, limit];
+
     const result = await db.query(
-      `SELECT m.id,m.conversation_id,m.sender_id,m.ciphertext,m.iv,m.attachment_id,m.created_at,
-              u.display_name AS sender_name
+      `SELECT m.id,m.conversation_id,m.sender_id,m.ciphertext,m.iv,m.attachment_id,
+              m.reply_to_id,m.thread_root_id,m.edited_at,m.deleted_at,m.created_at,
+              u.display_name AS sender_name,
+              COALESCE(rr.reactions,'[]'::json) AS reactions,
+              EXISTS(
+                SELECT 1 FROM conversation_pins cp
+                WHERE cp.conversation_id=m.conversation_id AND cp.message_id=m.id
+              ) AS pinned,
+              (
+                SELECT count(*)::int FROM messages cm
+                WHERE cm.thread_root_id=m.id AND cm.deleted_at IS NULL
+              ) AS comment_count
        FROM messages m
        JOIN users u ON u.id=m.sender_id
+       LEFT JOIN LATERAL (
+         SELECT json_agg(json_build_object('emoji',mr.emoji,'userId',mr.user_id) ORDER BY mr.created_at) AS reactions
+         FROM message_reactions mr
+         WHERE mr.message_id=m.id
+       ) rr ON true
        WHERE m.conversation_id=$1 AND m.id<$2
+       ${threadClause}
        ORDER BY m.id DESC LIMIT $3`,
-      [req.params.id, before, limit]
+      params
     );
     res.json({ messages: result.rows.reverse() });
   } catch (err) {
@@ -554,16 +840,41 @@ app.get("/api/conversations/:id/messages", auth, async (req, res, next) => {
 app.post("/api/conversations/:id/messages", auth, async (req, res, next) => {
   try {
     const conversationId = req.params.id;
-    if (!(await isMember(req.user.id, conversationId))) {
-      return res.status(403).json({ error: "forbidden" });
-    }
+    const member = await membership(req.user.id, conversationId);
+    if (!member) return res.status(403).json({ error: "forbidden" });
 
     const ciphertext = String(req.body?.ciphertext || "");
     const iv = String(req.body?.iv || "");
     const attachmentId = req.body?.attachmentId || null;
+    const replyToId = req.body?.replyToId ? Number(req.body.replyToId) : null;
+    const threadRootId = req.body?.threadRootId ? Number(req.body.threadRootId) : null;
 
     if (!ciphertext || ciphertext.length > 200_000 || !iv || iv.length > 200) {
       return res.status(400).json({ error: "invalid_message" });
+    }
+
+    if (member.kind === "channel") {
+      if (threadRootId) {
+        if (!member.comments_enabled) return res.status(403).json({ error: "comments_disabled" });
+        const root = await db.query(
+          `SELECT 1 FROM messages
+           WHERE id=$1 AND conversation_id=$2 AND thread_root_id IS NULL AND deleted_at IS NULL`,
+          [threadRootId, conversationId]
+        );
+        if (!root.rowCount) return res.status(400).json({ error: "invalid_thread" });
+      } else if (!canManage(member)) {
+        return res.status(403).json({ error: "channel_read_only" });
+      }
+    } else if (threadRootId) {
+      return res.status(400).json({ error: "threads_channel_only" });
+    }
+
+    if (replyToId) {
+      const reply = await db.query(
+        "SELECT 1 FROM messages WHERE id=$1 AND conversation_id=$2",
+        [replyToId, conversationId]
+      );
+      if (!reply.rowCount) return res.status(400).json({ error: "invalid_reply" });
     }
 
     if (attachmentId) {
@@ -575,15 +886,183 @@ app.post("/api/conversations/:id/messages", auth, async (req, res, next) => {
     }
 
     const result = await db.query(
-      `INSERT INTO messages(conversation_id,sender_id,ciphertext,iv,attachment_id)
-       VALUES($1,$2,$3,$4,$5)
-       RETURNING id,conversation_id,sender_id,ciphertext,iv,attachment_id,created_at`,
-      [conversationId, req.user.id, ciphertext, iv, attachmentId]
+      `INSERT INTO messages(conversation_id,sender_id,ciphertext,iv,attachment_id,reply_to_id,thread_root_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7)
+       RETURNING id,conversation_id,sender_id,ciphertext,iv,attachment_id,reply_to_id,thread_root_id,
+                 edited_at,deleted_at,created_at`,
+      [conversationId, req.user.id, ciphertext, iv, attachmentId, replyToId, threadRootId]
     );
 
-    const message = result.rows[0];
+    const message = { ...result.rows[0], reactions: [], pinned: false, comment_count: 0 };
     await emitConversation(conversationId, { type: "message", message });
     res.status(201).json({ message });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.patch("/api/conversations/:id/messages/:messageId", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const messageId = Number(req.params.messageId);
+    const member = await membership(req.user.id, conversationId);
+    if (!member) return res.status(403).json({ error: "forbidden" });
+
+    const current = await messageDetails(messageId, conversationId);
+    if (!current || current.deleted_at) return res.status(404).json({ error: "not_found" });
+    if (current.sender_id !== req.user.id) return res.status(403).json({ error: "forbidden" });
+
+    const ciphertext = String(req.body?.ciphertext || "");
+    const iv = String(req.body?.iv || "");
+    if (!ciphertext || ciphertext.length > 200_000 || !iv || iv.length > 200) {
+      return res.status(400).json({ error: "invalid_message" });
+    }
+
+    const result = await db.query(
+      `UPDATE messages SET ciphertext=$3,iv=$4,edited_at=now()
+       WHERE id=$1 AND conversation_id=$2
+       RETURNING id,conversation_id,sender_id,ciphertext,iv,attachment_id,reply_to_id,thread_root_id,
+                 edited_at,deleted_at,created_at`,
+      [messageId, conversationId, ciphertext, iv]
+    );
+    await emitConversation(conversationId, { type: "message-updated", message: result.rows[0] });
+    res.json({ message: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.delete("/api/conversations/:id/messages/:messageId", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const messageId = Number(req.params.messageId);
+    const member = await membership(req.user.id, conversationId);
+    if (!member) return res.status(403).json({ error: "forbidden" });
+
+    const current = await messageDetails(messageId, conversationId);
+    if (!current) return res.status(404).json({ error: "not_found" });
+    if (current.sender_id !== req.user.id && !canManage(member)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    if (current.attachment_id) {
+      const attachment = await db.query(
+        "SELECT storage_name FROM attachments WHERE id=$1",
+        [current.attachment_id]
+      );
+      const storageName = attachment.rows[0]?.storage_name;
+      await db.query("DELETE FROM attachments WHERE id=$1", [current.attachment_id]);
+      if (storageName) await fs.promises.unlink(path.join(DATA_DIR, "uploads", storageName)).catch(() => {});
+    }
+
+    await db.query(
+      `UPDATE messages
+       SET ciphertext='',iv='',attachment_id=NULL,deleted_at=now()
+       WHERE id=$1 AND conversation_id=$2`,
+      [messageId, conversationId]
+    );
+    await emitConversation(conversationId, { type: "message-deleted", conversationId, messageId });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/api/conversations/:id/messages/:messageId/reaction", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const messageId = Number(req.params.messageId);
+    if (!(await isMember(req.user.id, conversationId))) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    if (!(await messageDetails(messageId, conversationId))) {
+      return res.status(404).json({ error: "not_found" });
+    }
+    const emoji = String(req.body?.emoji || "").trim().slice(0, 16);
+    if (!emoji) return res.status(400).json({ error: "invalid_reaction" });
+    const exists = await db.query(
+      `SELECT emoji FROM message_reactions WHERE message_id=$1 AND user_id=$2`,
+      [messageId, req.user.id]
+    );
+    if (exists.rows[0]?.emoji === emoji) {
+      await db.query("DELETE FROM message_reactions WHERE message_id=$1 AND user_id=$2", [messageId, req.user.id]);
+    } else {
+      await db.query(
+        `INSERT INTO message_reactions(message_id,user_id,emoji)
+         VALUES($1,$2,$3)
+         ON CONFLICT (message_id,user_id) DO UPDATE SET emoji=excluded.emoji,created_at=now()`,
+        [messageId, req.user.id, emoji]
+      );
+    }
+    const reactions = await db.query(
+      `SELECT emoji,user_id AS "userId" FROM message_reactions WHERE message_id=$1 ORDER BY created_at`,
+      [messageId]
+    );
+    await emitConversation(conversationId, {
+      type: "message-reactions",
+      conversationId,
+      messageId,
+      reactions: reactions.rows
+    });
+    res.json({ reactions: reactions.rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/api/conversations/:id/messages/:messageId/pin", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const messageId = Number(req.params.messageId);
+    const member = await membership(req.user.id, conversationId);
+    if (!canManage(member)) return res.status(403).json({ error: "forbidden" });
+
+    const message = await messageDetails(messageId, conversationId);
+    if (!message) return res.status(404).json({ error: "not_found" });
+    const existing = await db.query(
+      "SELECT 1 FROM conversation_pins WHERE conversation_id=$1 AND message_id=$2",
+      [conversationId, messageId]
+    );
+    const pinned = !existing.rowCount;
+    if (pinned) {
+      await db.query(
+        `INSERT INTO conversation_pins(conversation_id,message_id,pinned_by)
+         VALUES($1,$2,$3)`,
+        [conversationId, messageId, req.user.id]
+      );
+    } else {
+      await db.query(
+        "DELETE FROM conversation_pins WHERE conversation_id=$1 AND message_id=$2",
+        [conversationId, messageId]
+      );
+    }
+    await emitConversation(conversationId, { type: "message-pinned", conversationId, messageId, pinned });
+    res.json({ pinned });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post("/api/conversations/:id/read", auth, async (req, res, next) => {
+  try {
+    const conversationId = req.params.id;
+    const messageId = Math.max(0, Number(req.body?.messageId || 0));
+    if (!(await isMember(req.user.id, conversationId))) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    await db.query(
+      `UPDATE conversation_members
+       SET last_read_message_id=GREATEST(last_read_message_id,$3)
+       WHERE conversation_id=$1 AND user_id=$2`,
+      [conversationId, req.user.id, messageId]
+    );
+    await emitConversation(conversationId, {
+      type: "read",
+      conversationId,
+      userId: req.user.id,
+      messageId
+    });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
@@ -718,6 +1197,23 @@ wss.on("connection", async (ws, req) => {
     try {
       msg = JSON.parse(raw.toString());
     } catch {
+      return;
+    }
+
+    if (msg.type === "typing") {
+      const conversationId = String(msg.conversationId || "");
+      if (!conversationId || !(await isMember(userId, conversationId))) return;
+      for (const peerId of await memberIds(conversationId)) {
+        if (peerId !== userId) {
+          emitToUser(peerId, {
+            type: "typing",
+            conversationId,
+            userId,
+            typing: Boolean(msg.typing),
+            threadRootId: msg.threadRootId ? Number(msg.threadRootId) : null
+          });
+        }
+      }
       return;
     }
 

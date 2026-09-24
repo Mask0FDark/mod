@@ -20,6 +20,15 @@
 - Русский, английский и украинский интерфейс.
 - PWA для установки веб-клиента.
 - Конфигурационная смена домена без переписывания веб-клиента.
+- Группы создаются сразу, без обязательного предварительного инвайта.
+- Каналы с ролями владельца, администратора и подписчика.
+- Комментарии к постам канала отдельными тредами.
+- Ответы на сообщения, редактирование и удаление.
+- Реакции и закреплённые сообщения.
+- Счётчики непрочитанного, отметки прочтения в личных чатах и typing-индикатор.
+- Управление ролями и удаление участников.
+- Per-chat mute и управление комментариями канала.
+- Браузерные уведомления для запущенного в фоне web/PWA-клиента.
 - Раздельные параметры контейнеров, web/TURN-портов и volumes для одновременных dev/prod окружений.
 - Письма с кодом подтверждения на русском, английском и украинском.
 
@@ -66,6 +75,15 @@
 - Russian, English and Ukrainian UI.
 - Installable PWA.
 - Configuration-driven domain migration.
+- Groups are created immediately without requiring an initial invite.
+- Channels with owner, admin and subscriber roles.
+- Threaded comments under channel posts.
+- Replies, message editing and deletion.
+- Reactions and pinned messages.
+- Unread counters, direct-chat read receipts and typing indicators.
+- Role management and member moderation.
+- Per-chat mute and channel comment controls.
+- Browser notifications while the web/PWA client is running in the background.
 - Separate container, web/TURN port and volume settings for parallel dev/prod deployments.
 - Verification emails in Russian, English and Ukrainian.
 
