@@ -171,6 +171,7 @@ const state = {
     peerId: null,
     conversationId: null,
     video: false,
+    videoWanted: false,
     pc: null,
     localStream: null,
     screenStream: null,
@@ -182,7 +183,9 @@ const state = {
     offerer: false,
     recoveryTimer: null,
     failureTimer: null,
-    recoveryAttempts: 0
+    recoveryAttempts: 0,
+    mediaRepairing: false,
+    resumeRepairTimer: null
   }
 };
 
@@ -1308,6 +1311,13 @@ async function initNativeShell() {
   if (!App) return;
 
   await App.addListener?.("appUrlOpen", event => applyNativeUrl(event?.url || ""));
+  await App.addListener?.("appStateChange", event => {
+    if (event?.isActive) {
+      syncViewport();
+      connectSocket();
+      scheduleCallMediaRepair(450);
+    }
+  });
   await LocalNotifications?.addListener?.("localNotificationActionPerformed", event => {
     const conversationId = event?.notification?.extra?.conversationId;
     if (!conversationId) return;
@@ -1985,8 +1995,171 @@ function restoreCall() {
 function showCallOverlay(name) {
   ui.callPeerName.textContent = name;
   ui.callBackdropAvatar.textContent = firstLetter(name);
+  ui.callBackdropAvatar.classList.remove("hidden");
+  ui.remoteVideo.style.visibility = "hidden";
   ui.callMiniBar?.classList.add("hidden");
   ui.callOverlay.classList.remove("hidden");
+}
+
+async function startNativeCallKeepAlive(video = false) {
+  const plugin = window.Capacitor?.Plugins?.CallKeepAlive;
+  if (!plugin?.start) return;
+  await plugin.start({ video: Boolean(video) }).catch(() => {});
+}
+
+async function updateNativeCallKeepAlive(video = false) {
+  const plugin = window.Capacitor?.Plugins?.CallKeepAlive;
+  if (!plugin?.update) return;
+  await plugin.update({ video: Boolean(video) }).catch(() => {});
+}
+
+async function stopNativeCallKeepAlive() {
+  const plugin = window.Capacitor?.Plugins?.CallKeepAlive;
+  if (!plugin?.stop) return;
+  await plugin.stop().catch(() => {});
+}
+
+function liveMediaTrack(stream, kind) {
+  return stream?.getTracks().find(track => track.kind === kind && track.readyState === "live") || null;
+}
+
+function syncRemoteCallVisual() {
+  const stream = ui.remoteVideo.srcObject;
+  const video = stream?.getVideoTracks?.().find(track => track.readyState === "live") || null;
+  const showingVideo = Boolean(video && !video.muted);
+  ui.remoteVideo.style.visibility = showingVideo ? "visible" : "hidden";
+  ui.callBackdropAvatar.classList.toggle("hidden", showingVideo);
+}
+
+function bindRemoteCallStream(stream) {
+  if (!stream) return;
+  ui.remoteVideo.srcObject = stream;
+  for (const track of stream.getVideoTracks()) {
+    track.onunmute = syncRemoteCallVisual;
+    track.onmute = syncRemoteCallVisual;
+    track.onended = syncRemoteCallVisual;
+  }
+  ui.remoteVideo.onloadeddata = syncRemoteCallVisual;
+  syncRemoteCallVisual();
+}
+
+function armLocalVideoTrack(track) {
+  if (!track) return;
+  track.onunmute = () => {
+    if (state.call.videoWanted && state.call.state !== "idle") {
+      state.call.video = true;
+      ui.localVideoFrame.classList.remove("hidden");
+      refreshCallButtons();
+    }
+  };
+  track.onmute = () => {
+    if (state.call.videoWanted && !document.hidden) scheduleCallMediaRepair(900);
+  };
+  track.onended = () => {
+    if (state.call.state === "idle") return;
+    state.call.video = false;
+    ui.localVideoFrame.classList.add("hidden");
+    refreshCallButtons();
+    if (state.call.videoWanted && !document.hidden) scheduleCallMediaRepair(350);
+  };
+}
+
+async function installLocalTrack(track) {
+  if (!track) return false;
+  if (!state.call.localStream) state.call.localStream = new MediaStream();
+
+  const oldTracks = state.call.localStream.getTracks().filter(item => item.kind === track.kind && item !== track);
+  for (const old of oldTracks) {
+    state.call.localStream.removeTrack(old);
+    try { old.stop(); } catch {}
+  }
+  if (!state.call.localStream.getTracks().includes(track)) state.call.localStream.addTrack(track);
+
+  const pc = state.call.pc;
+  if (!pc) return false;
+
+  if (typeof pc.getSenders !== "function" || typeof pc.addTrack !== "function") {
+    const streams = typeof pc.getLocalStreams === "function" ? pc.getLocalStreams() : [];
+    for (const stream of streams) {
+      try { pc.removeStream?.(stream); } catch {}
+    }
+    if (typeof pc.addStream === "function") pc.addStream(state.call.localStream);
+    return true;
+  }
+
+  const sender = pc.getSenders().find(item => item.track?.kind === track.kind);
+  if (sender) {
+    await sender.replaceTrack(track);
+    return false;
+  }
+  pc.addTrack(track, state.call.localStream);
+  return true;
+}
+
+async function reacquireCallAudio() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: false
+  });
+  const track = stream.getAudioTracks()[0];
+  if (!track) throw new Error("no_audio_track");
+  const needsRenegotiation = await installLocalTrack(track);
+  if (needsRenegotiation) await renegotiateCall();
+  return track;
+}
+
+async function reacquireCallVideo() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }
+  });
+  const track = stream.getVideoTracks()[0];
+  if (!track) throw new Error("no_camera_track");
+  armLocalVideoTrack(track);
+  const needsRenegotiation = await installLocalTrack(track);
+  state.call.video = true;
+  await updateNativeCallKeepAlive(true);
+  ui.localVideo.srcObject = state.call.localStream;
+  ui.localVideoFrame.classList.remove("hidden");
+  refreshCallButtons();
+  if (needsRenegotiation) await renegotiateCall();
+  return track;
+}
+
+function scheduleCallMediaRepair(delay = 350) {
+  clearTimeout(state.call.resumeRepairTimer);
+  state.call.resumeRepairTimer = setTimeout(() => {
+    repairActiveCallMedia().catch(() => {});
+  }, delay);
+}
+
+async function repairActiveCallMedia() {
+  if (state.call.state === "idle" || state.call.state === "ringing" || state.call.mediaRepairing) return;
+  state.call.mediaRepairing = true;
+  try {
+    connectSocket();
+    await startNativeCallKeepAlive(state.call.video);
+    const pc = state.call.pc;
+    if (pc && pc.connectionState !== "connected") scheduleCallRecovery(250);
+
+    const audio = liveMediaTrack(state.call.localStream, "audio");
+    if (!audio) await reacquireCallAudio();
+
+    const video = liveMediaTrack(state.call.localStream, "video");
+    if (state.call.videoWanted && !state.call.screenStream && (!video || video.muted)) {
+      await reacquireCallVideo();
+    } else if (video && state.call.videoWanted) {
+      video.enabled = true;
+      state.call.video = true;
+      ui.localVideo.srcObject = state.call.localStream;
+      ui.localVideoFrame.classList.remove("hidden");
+    }
+
+    await applyAudioRoute();
+    refreshCallButtons();
+  } finally {
+    state.call.mediaRepairing = false;
+  }
 }
 
 async function acquireCallMedia(video) {
@@ -2009,8 +2182,11 @@ async function acquireCallMedia(video) {
     }
   }
 
+  const videoTrack = liveMediaTrack(state.call.localStream, "video");
+  if (videoTrack) armLocalVideoTrack(videoTrack);
+  state.call.video = Boolean(videoTrack && videoTrack.enabled);
   ui.localVideo.srcObject = state.call.localStream;
-  ui.localVideoFrame.classList.toggle("hidden", !state.call.localStream.getVideoTracks().length);
+  ui.localVideoFrame.classList.toggle("hidden", !state.call.video);
   refreshCallButtons();
 }
 
@@ -2023,6 +2199,7 @@ async function startCall(video) {
   state.call.peerId = peer.id;
   state.call.conversationId = conversation.id;
   state.call.video = Boolean(video);
+  state.call.videoWanted = Boolean(video);
   state.call.speaker = Boolean(video);
   state.call.offerer = true;
   state.call.recoveryAttempts = 0;
@@ -2033,6 +2210,7 @@ async function startCall(video) {
 
   try {
     await acquireCallMedia(video);
+    await startNativeCallKeepAlive(state.call.video);
     await applyAudioRoute();
     sendSignal({
       type: "call-request",
@@ -2078,6 +2256,7 @@ async function handleCallSignal(message) {
     state.call.peerId = message.from;
     state.call.conversationId = message.conversationId;
     state.call.video = Boolean(message.video);
+    state.call.videoWanted = Boolean(message.video);
     state.call.speaker = Boolean(message.video);
     state.call.offerer = false;
     state.call.recoveryAttempts = 0;
@@ -2154,6 +2333,7 @@ async function acceptIncomingCall() {
 
   try {
     await acquireCallMedia(state.call.video);
+    await startNativeCallKeepAlive(state.call.video);
     await applyAudioRoute();
     sendSignal({
       type: "call-accept",
@@ -2265,13 +2445,21 @@ async function buildPeer(offerer, remoteOffer = null) {
   });
   state.call.pc = pc;
 
-  for (const track of state.call.localStream.getTracks()) {
-    pc.addTrack(track, state.call.localStream);
+  if (typeof pc.addTrack === "function") {
+    for (const track of state.call.localStream.getTracks()) {
+      pc.addTrack(track, state.call.localStream);
+    }
+  } else if (typeof pc.addStream === "function") {
+    pc.addStream(state.call.localStream);
   }
 
   pc.ontrack = event => {
-    ui.remoteVideo.srcObject = event.streams[0];
-    ui.remoteVideo.style.visibility = "visible";
+    const stream = event.streams[0] || new MediaStream([event.track]);
+    bindRemoteCallStream(stream);
+    applyAudioRoute();
+  };
+  pc.onaddstream = event => {
+    bindRemoteCallStream(event.stream);
     applyAudioRoute();
   };
 
@@ -2418,10 +2606,12 @@ function finishCall(notify = true) {
   }
 
   clearCallRecoveryTimers();
+  clearTimeout(state.call.resumeRepairTimer);
   closePeerOnly();
   clearInterval(state.call.timer);
   clearInterval(state.call.stats);
   window.Capacitor?.Plugins?.AudioRoute?.reset?.().catch(() => {});
+  stopNativeCallKeepAlive().catch(() => {});
 
   if (state.call.localStream) {
     for (const track of state.call.localStream.getTracks()) track.stop();
@@ -2435,6 +2625,7 @@ function finishCall(notify = true) {
     peerId: null,
     conversationId: null,
     video: false,
+    videoWanted: false,
     pc: null,
     localStream: null,
     screenStream: null,
@@ -2446,11 +2637,14 @@ function finishCall(notify = true) {
     offerer: false,
     recoveryTimer: null,
     failureTimer: null,
-    recoveryAttempts: 0
+    recoveryAttempts: 0,
+    mediaRepairing: false,
+    resumeRepairTimer: null
   };
 
   ui.remoteVideo.srcObject = null;
   ui.remoteVideo.style.visibility = "hidden";
+  ui.callBackdropAvatar.classList.remove("hidden");
   ui.localVideo.srcObject = null;
   ui.callOverlay.classList.add("hidden");
   ui.callMiniBar?.classList.add("hidden");
@@ -2496,51 +2690,34 @@ async function renegotiateCall() {
 }
 
 async function toggleCamera() {
-  let track = state.call.localStream?.getVideoTracks()[0] || null;
+  const track = liveMediaTrack(state.call.localStream, "video");
 
-  if (track) {
-    track.enabled = !track.enabled;
-    state.call.video = track.enabled;
-    ui.localVideo.srcObject = state.call.localStream;
-    ui.localVideoFrame.classList.toggle("hidden", !track.enabled);
+  if (track && track.enabled) {
+    state.call.videoWanted = false;
+    state.call.video = false;
+    track.enabled = false;
+    updateNativeCallKeepAlive(false).catch(() => {});
+    ui.localVideoFrame.classList.add("hidden");
     refreshCallButtons();
     return;
   }
 
+  state.call.videoWanted = true;
   try {
-    const cameraStream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }
-    });
-    track = cameraStream.getVideoTracks()[0];
-    if (!track) throw new Error("no_camera_track");
-
-    if (!state.call.localStream) state.call.localStream = new MediaStream();
-    state.call.localStream.addTrack(track);
-    state.call.video = true;
-
-    const pc = state.call.pc;
-    if (pc) {
-      const sender = pc.getSenders().find(item => item.track?.kind === "video");
-      if (sender) await sender.replaceTrack(track);
-      else pc.addTrack(track, state.call.localStream);
-      await renegotiateCall();
+    if (track) {
+      track.enabled = true;
+      state.call.video = true;
+      await updateNativeCallKeepAlive(true);
+      ui.localVideo.srcObject = state.call.localStream;
+      ui.localVideoFrame.classList.remove("hidden");
+      refreshCallButtons();
+      return;
     }
-
-    track.onended = () => {
-      if (state.call.localStream?.getVideoTracks().includes(track)) {
-        track.enabled = false;
-        state.call.video = false;
-        ui.localVideoFrame.classList.add("hidden");
-        refreshCallButtons();
-      }
-    };
-
-    ui.localVideo.srcObject = state.call.localStream;
-    ui.localVideoFrame.classList.remove("hidden");
-    refreshCallButtons();
+    await reacquireCallVideo();
   } catch {
+    state.call.video = false;
     showToast(t("noCamera"));
+    refreshCallButtons();
   }
 }
 
@@ -2909,9 +3086,19 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.me) {
     connectSocket();
     markVisibleMessagesRead();
+    scheduleCallMediaRepair(450);
   }
 });
-window.addEventListener("online", connectSocket);
+window.addEventListener("pageshow", () => {
+  if (state.me) {
+    connectSocket();
+    scheduleCallMediaRepair(500);
+  }
+});
+window.addEventListener("online", () => {
+  connectSocket();
+  scheduleCallMediaRepair(350);
+});
 window.addEventListener("hashchange", scheduleChatRoute);
 window.addEventListener("popstate", scheduleChatRoute);
 ui.attachButton.addEventListener("click", () => ui.fileInput.click());
