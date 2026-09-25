@@ -443,15 +443,19 @@ async function renderConversationList() {
   const request = ++state.userSearchRequest;
   const list = state.conversations.filter(c => {
     const matchesQuery = (conversationName(c)+" "+c.members.map(m=>m.username?"@"+m.username:"").join(" ")).toLowerCase().includes(query);
-    const matchesFilter = state.mobileChatFilter === "all" || c.kind === state.mobileChatFilter;
+    const filter = ["all", "direct", "group", "channel"].includes(state.mobileChatFilter) ? state.mobileChatFilter : "all";
+    const matchesFilter = filter === "all" || c.kind === filter;
     return matchesQuery && matchesFilter;
   });
+  const scrollTop = ui.chatList.scrollTop;
   ui.chatList.replaceChildren();
 
   for (const conversation of list) {
     const row = document.createElement("button");
     row.className = "chat-row" + (state.activeConversation?.id === conversation.id ? " active" : "");
     row.type = "button";
+    row.dataset.conversationId = conversation.id;
+    row.setAttribute("aria-current", String(state.activeConversation?.id === conversation.id));
 
     const avatar = document.createElement("div");
     avatar.className = "avatar";
@@ -470,6 +474,12 @@ async function renderConversationList() {
       </div>
     `;
     main.querySelector(".chat-row-name").textContent = conversationName(conversation);
+    if (conversation.notifications_enabled === false) {
+      const mute = document.createElement("span"); mute.className = "chat-muted"; mute.textContent = "◌"; mute.title = t("mute"); main.querySelector(".chat-row-top").append(mute);
+    }
+    if (conversation.pinned_count > 0) {
+      const pin = document.createElement("span"); pin.className = "chat-pinned"; pin.textContent = "⌖"; pin.title = t("pinnedMessages"); main.querySelector(".chat-row-bottom").append(pin);
+    }
     row.append(avatar, main);
     row.addEventListener("click", () => openConversation(conversation.id));
     ui.chatList.appendChild(row);
@@ -480,6 +490,7 @@ async function renderConversationList() {
     });
   }
 
+  ui.chatList.scrollTop = scrollTop;
   let globalResult = false;
   const usernameMatch = query.match(/^@([a-z][a-z0-9_]{3,31})$/);
   const directAlreadyShown = usernameMatch && list.some(c =>
@@ -540,7 +551,8 @@ async function refreshConversations(request) {
   // the newer refresh is applied, not continue with an out-of-date list.
   if (request !== state.conversationRequest) return state.conversationLoad;
   const previous = new Map(state.conversations.map(c => [c.id, c]));
-  state.conversations = result.conversations || [];
+  if (!Array.isArray(result.conversations)) throw new Error("invalid_conversations_response");
+  state.conversations = result.conversations;
   for (const conversation of state.conversations) {
     // A list request may have started before a read acknowledgement arrived.
     const old = previous.get(conversation.id);
@@ -556,6 +568,7 @@ async function refreshConversations(request) {
   }
   await renderConversationList();
   updateChatHeader();
+  await refreshPinnedMessage();
 }
 
 function updateChatHeader() {
@@ -577,6 +590,8 @@ function updateChatHeader() {
   ui.messageInput.classList.toggle("hidden", readOnly);
   ui.attachButton.classList.toggle("hidden", readOnly);
   ui.sendButton.classList.toggle("hidden", readOnly);
+  $("emojiButton")?.classList.toggle("hidden", readOnly);
+  $("voiceMessageButton")?.classList.toggle("hidden", readOnly);
 }
 
 function clearComposerContext() {
@@ -646,6 +661,8 @@ async function openConversation(id, { syncUrl = true } = {}) {
   if (state.activeConversation) {
     state.drafts.set(state.activeConversation.id, { text: ui.messageInput.value, reply: state.replyTo, editing: state.editingMessage });
   }
+  cancelVoiceRecording();
+  $("pinnedMessageBar")?.classList.add("hidden");
   resetMessageView(ui.messageList, state.messageView);
   resetMessageView(ui.threadMessageList, state.threadView);
   state.messageCache.clear();
@@ -671,6 +688,7 @@ async function openConversation(id, { syncUrl = true } = {}) {
   if (syncUrl) syncConversationUrl(conversation);
   await renderConversationList();
   await loadMessages();
+  await refreshPinnedMessage();
 }
 
 async function loadMessages() {
@@ -730,10 +748,16 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
   const mine = message.sender_id === state.me.id;
   row.className = "message-row " + (mine ? "out" : "in");
   row.dataset.messageId = message.id;
+  row.dataset.createdAt = message.created_at;
   row.classList.toggle("channel-post",conversation.kind==="channel"&&!isThread);
   if(message.system_event)row.classList.add("call-message");
 
   const bubble = document.createElement("div");
+  bubble.tabIndex = 0;
+  bubble.addEventListener("click", event => {
+    if (!event.target.closest("button,a,img,video,audio") && matchMedia("(max-width:760px)").matches) row.classList.toggle("actions-open");
+  });
+  bubble.addEventListener("keydown", event => { if (event.key === "Escape") row.classList.remove("actions-open"); });
   bubble.className = "message-bubble" + (message.deleted_at ? " deleted" : "");
 
   if ((conversation.kind === "group" || conversation.kind === "channel" || isThread) && !mine) {
@@ -892,6 +916,7 @@ async function appendMessage(message, roomKey = null, host = ui.messageList, isT
     const next = Array.from(host.children).find(item => Number(item.dataset.messageId) > Number(message.id));
     host.insertBefore(row, next || null);
   }
+  updateDateLabels(host);
 }
 
 async function renderAttachment(host, attachment, roomKey) {
@@ -1193,6 +1218,8 @@ function closeActiveConversationFromRoute() {
     state.drafts.set(state.activeConversation.id, { text: ui.messageInput.value, reply: state.replyTo, editing: state.editingMessage });
   }
   state.activeConversation = null;
+  cancelVoiceRecording();
+  $("pinnedMessageBar")?.classList.add("hidden");
   resetMessageView(ui.messageList, state.messageView);
   resetMessageView(ui.threadMessageList, state.threadView);
   state.messageCache.clear();
@@ -1849,6 +1876,7 @@ function connectSocket() {
       }
 
       if (["message-updated", "message-deleted", "message-reactions", "message-pinned"].includes(message.type)) {
+        if (message.type === "message-pinned" || message.type === "message-deleted") refreshPinnedMessage().catch(() => {});
         if (state.activeConversation?.id === message.conversationId || state.activeConversation?.id === message.message?.conversation_id) {
           await loadMessages();
           if (state.threadRoot && !ui.threadModal.classList.contains("hidden")) await loadThreadMessages();
@@ -2536,6 +2564,8 @@ document.querySelectorAll(".language-button").forEach(button => {
     setLanguage(button.dataset.lang);
     updateChatHeader();
     await renderConversationList();
+    updateShellLabels();
+    updateDateLabels(ui.messageList);
   });
 });
 
@@ -2871,6 +2901,121 @@ const versionNote=document.createElement("div");
 versionNote.className="settings-version";
 versionNote.textContent="M0D Android · 0.2.0 dev";
 ui.settingsDrawer.append(versionNote);
+
+function updateDateLabels(host) {
+  let previous = null;
+  for (const row of host.querySelectorAll('.message-row')) {
+    const date = new Date(row.dataset.createdAt);
+    if (!Number.isFinite(date.getTime())) continue;
+    const key = date.toDateString();
+    if (key !== previous) row.dataset.dateLabel = new Intl.DateTimeFormat(getLanguage(), {day:'numeric',month:'long'}).format(date);
+    else delete row.dataset.dateLabel;
+    previous = key;
+  }
+}
+let pinnedRequest = 0;
+async function refreshPinnedMessage() {
+  const bar = $('pinnedMessageBar');
+  if (!bar) return;
+  const request = ++pinnedRequest;
+  const conversation = state.activeConversation;
+  bar.classList.add('hidden');
+  if (!conversation || !conversation.pinned_count) return;
+  try {
+    const result = await api(`/api/conversations/${conversation.id}/pins`);
+    const pin = result.messages?.[0];
+    if (!pin) return;
+    const key = await unlockConversationKey(conversation);
+    const body = pin.system_event ? {text:callText(pin.system_event)} : await decryptJson(key,pin);
+    if (request !== pinnedRequest || conversation.id !== state.activeConversation?.id) return;
+    bar.textContent = '⌖ ' + (body.text || body.attachment?.name || t('file'));
+    bar.classList.remove('hidden');
+    bar.onclick = async () => {
+      let row = ui.messageList.querySelector(`[data-message-id="${pin.id}"]`);
+      if (!row) { await appendMessage(pin,key); row = ui.messageList.querySelector(`[data-message-id="${pin.id}"]`); }
+      row?.scrollIntoView({block:'center',behavior:'smooth'});
+    };
+  } catch { /* Keep chat usable if pin was concurrently removed. */ }
+}
+let voiceRecording = null;
+function cancelVoiceRecording() {
+  const active = voiceRecording; voiceRecording = null;
+  if (!active) return;
+  active.cancelled = true;
+  if (active.recorder.state !== 'inactive') active.recorder.stop();
+  active.stream.getTracks().forEach(track => track.stop());
+  $('voiceMessageButton')?.classList.remove('recording');
+}
+async function toggleVoiceMessage() {
+  if (voiceRecording) { voiceRecording.recorder.stop(); return; }
+  if (!state.activeConversation || !canPostToConversation(state.activeConversation)) return;
+  const conversationId = state.activeConversation.id;
+  const button = $('voiceMessageButton'); button.disabled = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    if (state.activeConversation?.id !== conversationId) { stream.getTracks().forEach(t=>t.stop()); return; }
+    const recorder = new MediaRecorder(stream);
+    const active = {stream,recorder,conversationId,chunks:[],cancelled:false}; voiceRecording=active;
+    recorder.ondataavailable = event => { if(event.data.size) active.chunks.push(event.data); };
+    recorder.onstop = async () => {
+      clearTimeout(active.timeout); stream.getTracks().forEach(track=>track.stop());
+      if (voiceRecording === active) voiceRecording=null;
+      button.classList.remove('recording');
+      if (active.cancelled || state.activeConversation?.id !== conversationId) return;
+      const extension = recorder.mimeType.includes('mp4') ? 'm4a' : 'webm';
+      const file=new File(active.chunks,`Voice-${Date.now()}.${extension}`,{type:recorder.mimeType});
+      if(file.size) await sendFile(file).catch(error=>showFileRetry(file,error));
+    };
+    recorder.start();button.classList.add('recording');
+    active.timeout=setTimeout(()=>{if(recorder.state==='recording')recorder.stop();},120000);
+  } catch { showToast(t('mediaError')); }
+  finally {button.disabled=false;}
+}
+function shellText(key) {
+  const copy = {ru:{account:'Аккаунт',storage:'Данные и память',cache:'Очистить кэш приложения',cacheHint:'Переписка и ключи шифрования сохранятся.',logout:'Выйти из аккаунта',all:'Все',direct:'Личные',group:'Группы',channel:'Каналы',chats:'Чаты',calls:'Звонки'},en:{account:'Account',storage:'Data and storage',cache:'Clear app cache',cacheHint:'Messages and encryption keys are kept.',logout:'Log out',all:'All',direct:'Direct',group:'Groups',channel:'Channels',chats:'Chats',calls:'Calls'},uk:{account:'Обліковий запис',storage:'Дані та пам’ять',cache:'Очистити кеш застосунку',cacheHint:'Листування та ключі шифрування збережуться.',logout:'Вийти',all:'Усі',direct:'Особисті',group:'Групи',channel:'Канали',chats:'Чати',calls:'Дзвінки'}};
+  return (copy[getLanguage()]||copy.en)[key];
+}
+function updateShellLabels() {
+  for(const node of document.querySelectorAll('[data-shell-text]')) node.textContent=shellText(node.dataset.shellText);
+  for(const node of document.querySelectorAll('[data-filter]')) node.textContent=shellText(node.dataset.filter);
+  profileButton.textContent=bt('profile');
+  clearCacheButton.textContent=shellText('cache');settingsLogoutButton.textContent=shellText('logout');
+  const labels=[[ui.mobileProfileTab,bt('profile')],[ui.mobileCallsTab,shellText('calls')],[ui.mobileChatsTab,shellText('chats')],[ui.mobileSettingsTab,t('settings')]];
+  for(const [button,label] of labels)if(button?.lastElementChild)button.lastElementChild.textContent=label;
+}
+function setupMessengerUI() {
+  const language=ui.settingsDrawer.querySelector('.drawer-section');
+  const section=(key)=>{const node=document.createElement('section');node.className='drawer-section';const title=document.createElement('span');title.dataset.shellText=key;node.append(title);return node;};
+  const account=section('account');account.append(profileButton);language.before(account);
+  const storage=section('storage');storage.append(clearCacheButton);const hint=document.createElement('p');hint.className='settings-help';hint.dataset.shellText='cacheHint';storage.append(hint);
+  ui.settingsDrawer.querySelector('.drawer-note').before(storage);
+  versionNote.before(settingsLogoutButton);
+  updateShellLabels();
+  const icons = {
+    menuButton:'<path d="M4 6h16M4 12h16M4 18h16"/>',
+    attachButton:'<path d="m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7l9-9m-5 13 8-8"/>',
+    emojiButton:'<circle cx="12" cy="12" r="9"/><path d="M8 14q4 5 8 0M8 9h.1M16 9h.1"/>',
+    voiceMessageButton:'<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M6 10v2a6 6 0 0 0 12 0v-2M12 18v4M9 22h6"/>',
+    sendButton:'<path d="m4 3 17 9-17 9 4-9-4-9ZM8 12h13"/>',
+    audioCallButton:'<path d="M5 3h4l2 5-3 2q2 4 6 6l2-3 5 2v4q0 2-3 2C10 20 4 14 3 6q0-3 2-3Z"/>',
+    videoCallButton:'<rect x="3" y="6" width="12" height="12" rx="3"/><path d="m15 10 6-4v12l-6-4"/>',
+    chatInfoButton:'<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>'
+  };
+  for(const [id,path] of Object.entries(icons)){const node=$(id);if(node)node.innerHTML=`<svg viewBox="0 0 24 24" aria-hidden="true">${path}</svg>`;}
+  $('emojiButton')?.addEventListener('click',()=>{
+    const existing=document.querySelector('.emoji-picker');if(existing){existing.remove();return;}
+    const picker=document.createElement('div');picker.className='emoji-picker';
+    for(const emoji of ['😀','😂','❤️','👍','🔥','😊','🥰','😎','🎉','😢','🤔','🙏']){
+      const button=document.createElement('button');button.type='button';button.textContent=emoji;
+      button.onclick=()=>{const input=ui.messageInput;input.setRangeText(emoji,input.selectionStart,input.selectionEnd,'end');input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();picker.remove();};picker.append(button);
+    }ui.activeChat.append(picker);
+  });
+  $('voiceMessageButton')?.addEventListener('click',toggleVoiceMessage);
+  window.addEventListener('pagehide',cancelVoiceRecording);
+  const sync=()=>{document.documentElement.style.setProperty('--app-height',`${Math.round(window.visualViewport?.height||innerHeight)}px`);};
+  sync();window.visualViewport?.addEventListener('resize',sync);window.addEventListener('resize',sync);
+}
+setupMessengerUI();
 
 initNativeShell().catch(() => {});
 boot().catch(() => {

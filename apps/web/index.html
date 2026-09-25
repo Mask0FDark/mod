@@ -10,6 +10,7 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/messenger.css">
 </head>
 <body>
   <main id="authView" class="auth-view hidden">
@@ -115,6 +116,7 @@
           <button id="chatInfoButton" class="round-icon" aria-label="Chat info" title="Chat info">⋮</button>
         </header>
 
+        <button id="pinnedMessageBar" class="pinned-message-bar hidden" type="button"></button>
         <section id="messageList" class="message-list"></section>
 
         <footer class="composer">
@@ -131,6 +133,8 @@
             <textarea id="messageInput" rows="1" maxlength="12000" data-i18n-placeholder="message" placeholder="Сообщение"></textarea>
             <div id="readOnlyHint" class="read-only-hint hidden" data-i18n="channelReadOnly">Публиковать могут только администраторы</div>
           </div>
+          <button id="emojiButton" class="composer-icon" type="button" aria-label="Emoji">☺</button>
+          <button id="voiceMessageButton" class="composer-icon" type="button" aria-label="Voice message">♩</button>
           <button id="sendButton" class="send-button" aria-label="Send">➤</button>
         </footer>
       </div>

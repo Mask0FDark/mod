@@ -1,5 +1,5 @@
-const CACHE = "m0d-shell-v5-deep-links";
-const SHELL = ["/", "/styles.css", "/app.js", "/crypto.js", "/i18n.js", "/icon.svg", "/manifest.webmanifest"];
+const CACHE = "m0d-shell-v6-unified-ui";
+const SHELL = ["/", "/styles.css", "/messenger.css", "/app.js", "/crypto.js", "/i18n.js", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL.map(url => new Request(url, { cache: "reload" })))));
