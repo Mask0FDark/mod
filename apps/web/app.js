@@ -2053,7 +2053,20 @@ async function handleCallSignal(message) {
   }
 
   if (message.type === "offer") {
-    await buildPeer(false, message.sdp);
+    if (state.call.pc && state.call.pc.signalingState !== "closed") {
+      await state.call.pc.setRemoteDescription(message.sdp);
+      await flushPendingIce();
+      const answer = await state.call.pc.createAnswer();
+      await state.call.pc.setLocalDescription(answer);
+      sendSignal({
+        type: "answer",
+        to: state.call.peerId,
+        conversationId: state.call.conversationId,
+        sdp: state.call.pc.localDescription
+      });
+    } else {
+      await buildPeer(false, message.sdp);
+    }
     return;
   }
 
@@ -2320,12 +2333,66 @@ async function toggleMic() {
   refreshCallButtons();
 }
 
-function toggleCamera() {
-  const track = state.call.localStream?.getVideoTracks()[0];
-  if (!track) return showToast(t("noCamera"));
-  track.enabled = !track.enabled;
-  ui.localVideoFrame.classList.toggle("hidden", !track.enabled);
-  refreshCallButtons();
+async function renegotiateCall() {
+  const pc = state.call.pc;
+  if (!pc || pc.signalingState === "closed") return;
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  sendSignal({
+    type: "offer",
+    to: state.call.peerId,
+    conversationId: state.call.conversationId,
+    sdp: pc.localDescription
+  });
+}
+
+async function toggleCamera() {
+  let track = state.call.localStream?.getVideoTracks()[0] || null;
+
+  if (track) {
+    track.enabled = !track.enabled;
+    state.call.video = track.enabled;
+    ui.localVideo.srcObject = state.call.localStream;
+    ui.localVideoFrame.classList.toggle("hidden", !track.enabled);
+    refreshCallButtons();
+    return;
+  }
+
+  try {
+    const cameraStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    track = cameraStream.getVideoTracks()[0];
+    if (!track) throw new Error("no_camera_track");
+
+    if (!state.call.localStream) state.call.localStream = new MediaStream();
+    state.call.localStream.addTrack(track);
+    state.call.video = true;
+
+    const pc = state.call.pc;
+    if (pc) {
+      const sender = pc.getSenders().find(item => item.track?.kind === "video");
+      if (sender) await sender.replaceTrack(track);
+      else pc.addTrack(track, state.call.localStream);
+      await renegotiateCall();
+    }
+
+    track.onended = () => {
+      if (state.call.localStream?.getVideoTracks().includes(track)) {
+        track.enabled = false;
+        state.call.video = false;
+        ui.localVideoFrame.classList.add("hidden");
+        refreshCallButtons();
+      }
+    };
+
+    ui.localVideo.srcObject = state.call.localStream;
+    ui.localVideoFrame.classList.remove("hidden");
+    refreshCallButtons();
+  } catch {
+    showToast(t("noCamera"));
+  }
 }
 
 async function toggleScreen() {

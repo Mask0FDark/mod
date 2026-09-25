@@ -1,4 +1,4 @@
-const CACHE = "m0d-shell-v6-unified-ui";
+const CACHE = "m0d-shell-v7-call-video-toggle";
 const SHELL = ["/", "/styles.css", "/messenger.css", "/app.js", "/crypto.js", "/i18n.js", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", event => {
