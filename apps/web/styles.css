@@ -1000,3 +1000,48 @@ button, .chat-row { -webkit-tap-highlight-color: transparent; }
 }
 .mobile-nav-icon{display:grid;place-items:center;width:26px;height:26px}
 .mobile-nav-icon svg{width:24px;height:24px}
+
+.call-mini{
+  position:fixed;z-index:119;top:max(12px,env(safe-area-inset-top));left:50%;
+  transform:translateX(-50%);display:flex;align-items:center;gap:7px;
+  width:min(430px,calc(100vw - 24px));padding:7px;
+  border:1px solid rgba(255,255,255,.09);border-radius:18px;
+  background:rgba(15,23,31,.94);backdrop-filter:blur(18px);
+  box-shadow:0 14px 38px rgba(0,0,0,.34)
+}
+.call-mini-main{
+  min-width:0;flex:1;height:48px;padding:0 9px;border:0;border-radius:13px;
+  background:transparent;color:#fff;display:flex;align-items:center;gap:10px;text-align:left;cursor:pointer
+}
+.call-mini-main:hover{background:rgba(255,255,255,.055)}
+.call-mini-pulse{
+  width:10px;height:10px;flex:0 0 auto;border-radius:50%;background:#40d67c;
+  box-shadow:0 0 0 0 rgba(64,214,124,.4);animation:callMiniPulse 1.7s infinite
+}
+.call-mini-copy{min-width:0;flex:1}
+.call-mini-copy strong,.call-mini-copy span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.call-mini-copy strong{font-size:14px;line-height:18px}
+.call-mini-copy span{margin-top:2px;color:#9eaab6;font-size:12px;line-height:15px}
+.call-mini-expand{color:#9d77ff;font-size:18px}
+.call-mini-control{
+  width:42px;height:42px;flex:0 0 auto;border:0;border-radius:50%;
+  background:rgba(255,255,255,.10);color:#fff;font-size:17px;cursor:pointer
+}
+.call-mini-control.off{background:#87424a}
+.call-mini-control.danger{background:var(--red);transform:rotate(135deg)}
+@keyframes callMiniPulse{
+  0%{box-shadow:0 0 0 0 rgba(64,214,124,.38)}
+  70%{box-shadow:0 0 0 8px rgba(64,214,124,0)}
+  100%{box-shadow:0 0 0 0 rgba(64,214,124,0)}
+}
+@media(max-width:760px){
+  .call-mini{
+    top:max(8px,env(safe-area-inset-top));width:calc(100vw - 16px);padding:6px;border-radius:16px
+  }
+  .call-mini-main{height:46px;padding:0 7px}
+  .call-mini-control{width:40px;height:40px}
+}
+
+.call-mini.recovering .call-mini-pulse{
+  background:#f3b55b;box-shadow:0 0 0 0 rgba(243,181,91,.38)
+}

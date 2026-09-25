@@ -107,6 +107,12 @@ const ui = {
   threadInput: $("threadInput"),
   threadSendButton: $("threadSendButton"),
   callOverlay: $("callOverlay"),
+  callMiniBar: $("callMiniBar"),
+  restoreCallButton: $("restoreCallButton"),
+  callMiniName: $("callMiniName"),
+  callMiniStatus: $("callMiniStatus"),
+  miniMicButton: $("miniMicButton"),
+  miniEndCallButton: $("miniEndCallButton"),
   remoteVideo: $("remoteVideo"),
   callBackdropAvatar: $("callBackdropAvatar"),
   minimizeCallButton: $("minimizeCallButton"),
@@ -172,7 +178,11 @@ const state = {
     startedAt: 0,
     timer: null,
     stats: null,
-    speaker: true
+    speaker: true,
+    offerer: false,
+    recoveryTimer: null,
+    failureTimer: null,
+    recoveryAttempts: 0
   }
 };
 
@@ -1796,6 +1806,9 @@ function connectSocket() {
       if (state.ws !== ws) return;
       await loadMessages();
       if (state.threadRoot) await loadThreadMessages();
+      if (state.call.pc && state.call.state !== "idle" && state.call.pc.connectionState !== "connected") {
+        scheduleCallRecovery(250);
+      }
     }).catch(() => showToast(t("serverError")));
   });
 
@@ -1918,7 +1931,10 @@ function connectSocket() {
 function sendSignal(payload) {
   if (state.ws?.readyState === WebSocket.OPEN) {
     state.ws.send(JSON.stringify(payload));
+    return true;
   }
+  connectSocket();
+  return false;
 }
 
 function sendTyping(typing, threadRootId = null) {
@@ -1938,9 +1954,38 @@ function pulseTyping(threadRootId = null) {
   state.typingTimer = setTimeout(() => sendTyping(false, threadRootId), 1500);
 }
 
+function syncCallMini() {
+  if (!ui.callMiniBar) return;
+  const active = state.call.state !== "idle";
+  if (!active) {
+    ui.callMiniBar.classList.add("hidden");
+    return;
+  }
+  ui.callMiniName.textContent = ui.callPeerName.textContent || "M0D";
+  ui.callMiniStatus.textContent = ui.callStatus.textContent || t("connecting");
+  const audio = state.call.localStream?.getAudioTracks()[0];
+  const muted = Boolean(audio && !audio.enabled);
+  ui.miniMicButton.textContent = muted ? "🔇" : "🎙";
+  ui.miniMicButton.classList.toggle("off", muted);
+}
+
+function minimizeCall() {
+  if (state.call.state === "idle") return;
+  ui.callOverlay.classList.add("hidden");
+  ui.callMiniBar.classList.remove("hidden");
+  syncCallMini();
+}
+
+function restoreCall() {
+  if (state.call.state === "idle") return;
+  ui.callMiniBar.classList.add("hidden");
+  ui.callOverlay.classList.remove("hidden");
+}
+
 function showCallOverlay(name) {
   ui.callPeerName.textContent = name;
   ui.callBackdropAvatar.textContent = firstLetter(name);
+  ui.callMiniBar?.classList.add("hidden");
   ui.callOverlay.classList.remove("hidden");
 }
 
@@ -1979,6 +2024,8 @@ async function startCall(video) {
   state.call.conversationId = conversation.id;
   state.call.video = Boolean(video);
   state.call.speaker = Boolean(video);
+  state.call.offerer = true;
+  state.call.recoveryAttempts = 0;
   showCallOverlay(conversationName(conversation));
   ui.callStatus.textContent = t("calling");
   ui.incomingActions.classList.add("hidden");
@@ -2032,6 +2079,8 @@ async function handleCallSignal(message) {
     state.call.conversationId = message.conversationId;
     state.call.video = Boolean(message.video);
     state.call.speaker = Boolean(message.video);
+    state.call.offerer = false;
+    state.call.recoveryAttempts = 0;
     showCallOverlay(conversationName(conversation));
     ui.callStatus.textContent = t("incomingCall");
     ui.incomingActions.classList.remove("hidden");
@@ -2127,6 +2176,83 @@ function declineIncomingCall() {
   finishCall(false);
 }
 
+function clearCallRecoveryTimers() {
+  clearTimeout(state.call.recoveryTimer);
+  clearTimeout(state.call.failureTimer);
+  state.call.recoveryTimer = null;
+  state.call.failureTimer = null;
+}
+
+function scheduleCallRecovery(delay = 1800) {
+  const pc = state.call.pc;
+  if (!pc || state.call.state === "idle" || pc.connectionState === "closed") return;
+
+  ui.callRoute.textContent = "ICE · reconnect";
+  ui.callMiniBar?.classList.add("recovering");
+  syncCallMini();
+
+  if (!state.call.failureTimer) {
+    state.call.failureTimer = setTimeout(() => {
+      const current = state.call.pc;
+      if (!current || state.call.state === "idle" || current.connectionState === "connected") return;
+      showToast(t("callEnded"));
+      finishCall(true);
+    }, 25000);
+  }
+
+  if (!state.call.offerer) return;
+  clearTimeout(state.call.recoveryTimer);
+  state.call.recoveryTimer = setTimeout(() => {
+    recoverCallConnection().catch(() => {
+      if (state.call.state !== "idle") scheduleCallRecovery(1800);
+    });
+  }, delay);
+}
+
+async function recoverCallConnection() {
+  const pc = state.call.pc;
+  if (!pc || state.call.state === "idle" || !state.call.offerer) return;
+  if (pc.connectionState === "connected") {
+    clearCallRecoveryTimers();
+    state.call.recoveryAttempts = 0;
+    return;
+  }
+  if (state.call.recoveryAttempts >= 5) return;
+
+  if (state.ws?.readyState !== WebSocket.OPEN) {
+    connectSocket();
+    scheduleCallRecovery(1500);
+    return;
+  }
+  if (pc.signalingState !== "stable") {
+    scheduleCallRecovery(900);
+    return;
+  }
+
+  state.call.recoveryAttempts += 1;
+  pc.restartIce?.();
+  const offer = await pc.createOffer({ iceRestart: true });
+  await pc.setLocalDescription(offer);
+  sendSignal({
+    type: "offer",
+    to: state.call.peerId,
+    conversationId: state.call.conversationId,
+    sdp: pc.localDescription
+  });
+  ui.callRoute.textContent = `ICE · retry ${state.call.recoveryAttempts}`;
+  syncCallMini();
+}
+
+function callConnectionRecovered() {
+  clearCallRecoveryTimers();
+  state.call.recoveryAttempts = 0;
+  if (!state.call.startedAt) state.call.startedAt = Date.now();
+  state.call.state = "active";
+  ui.callMiniBar?.classList.remove("recovering");
+  startCallTimers();
+  syncCallMini();
+}
+
 async function buildPeer(offerer, remoteOffer = null) {
   if (!state.call.localStream) await acquireCallMedia(state.call.video);
   closePeerOnly();
@@ -2161,14 +2287,28 @@ async function buildPeer(offerer, remoteOffer = null) {
   };
 
   pc.onconnectionstatechange = () => {
-    if (!state.call.pc) return;
+    if (state.call.pc !== pc) return;
     if (pc.connectionState === "connected") {
-      state.call.state = "active";
-      state.call.startedAt = Date.now();
-      ui.callStatus.textContent = t("inCall");
-      startCallTimers();
-    } else if (pc.connectionState === "failed") {
-      finishCall(true);
+      callConnectionRecovered();
+      return;
+    }
+    if (pc.connectionState === "disconnected") {
+      scheduleCallRecovery(2500);
+      return;
+    }
+    if (pc.connectionState === "failed") {
+      scheduleCallRecovery(0);
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    if (state.call.pc !== pc) return;
+    if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+      if (pc.connectionState === "connected") callConnectionRecovered();
+    } else if (pc.iceConnectionState === "disconnected") {
+      scheduleCallRecovery(2500);
+    } else if (pc.iceConnectionState === "failed") {
+      scheduleCallRecovery(0);
     }
   };
 
@@ -2217,6 +2357,7 @@ function startCallTimers() {
     const seconds = Math.floor((Date.now() - state.call.startedAt) / 1000);
     ui.callStatus.textContent =
       `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+    syncCallMini();
   };
   updateTimer();
   updateCallStats();
@@ -2262,6 +2403,7 @@ function closePeerOnly() {
   state.call.pc.ontrack = null;
   state.call.pc.onicecandidate = null;
   state.call.pc.onconnectionstatechange = null;
+  state.call.pc.oniceconnectionstatechange = null;
   state.call.pc.close();
   state.call.pc = null;
 }
@@ -2275,6 +2417,7 @@ function finishCall(notify = true) {
     });
   }
 
+  clearCallRecoveryTimers();
   closePeerOnly();
   clearInterval(state.call.timer);
   clearInterval(state.call.stats);
@@ -2299,13 +2442,18 @@ function finishCall(notify = true) {
     startedAt: 0,
     timer: null,
     stats: null,
-    speaker: true
+    speaker: true,
+    offerer: false,
+    recoveryTimer: null,
+    failureTimer: null,
+    recoveryAttempts: 0
   };
 
   ui.remoteVideo.srcObject = null;
   ui.remoteVideo.style.visibility = "hidden";
   ui.localVideo.srcObject = null;
   ui.callOverlay.classList.add("hidden");
+  ui.callMiniBar?.classList.add("hidden");
   ui.incomingActions.classList.add("hidden");
   ui.activeCallControls.classList.add("hidden");
 }
@@ -2321,6 +2469,7 @@ function refreshCallButtons() {
   ui.speakerButton.textContent = state.call.speaker ? "🔊" : "◖";
   ui.speakerButton.title = state.call.speaker ? t("speaker") : t("earpiece");
   ui.speakerButton.setAttribute("aria-pressed", String(state.call.speaker));
+  syncCallMini();
 }
 
 async function toggleMic() {
@@ -2781,7 +2930,11 @@ ui.micButton.addEventListener("click", toggleMic);
 ui.cameraButton.addEventListener("click", toggleCamera);
 ui.screenButton.addEventListener("click", toggleScreen);
 ui.speakerButton.addEventListener("click", toggleSpeaker);
-ui.minimizeCallButton.addEventListener("click", () => ui.callOverlay.classList.add("hidden"));
+ui.minimizeCallButton.addEventListener("click", minimizeCall);
+ui.restoreCallButton?.addEventListener("click", restoreCall);
+ui.miniMicButton?.addEventListener("click", toggleMic);
+ui.miniEndCallButton?.addEventListener("click", () => finishCall(true));
+new MutationObserver(syncCallMini).observe(ui.callStatus, { childList: true, characterData: true, subtree: true });
 
 window.addEventListener("beforeunload", () => {
   if (state.call.state !== "idle" && state.call.peerId) {

@@ -296,6 +296,19 @@
     </footer>
   </div>
 
+  <div id="callMiniBar" class="call-mini hidden" role="region" aria-label="Активный звонок">
+    <button id="restoreCallButton" class="call-mini-main" type="button">
+      <span class="call-mini-pulse" aria-hidden="true"></span>
+      <span class="call-mini-copy">
+        <strong id="callMiniName">—</strong>
+        <span id="callMiniStatus">—</span>
+      </span>
+      <span class="call-mini-expand" aria-hidden="true">↗</span>
+    </button>
+    <button id="miniMicButton" class="call-mini-control" type="button" aria-label="Микрофон">🎙</button>
+    <button id="miniEndCallButton" class="call-mini-control danger" type="button" aria-label="Завершить звонок">☎</button>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
   <script type="module" src="/app.js"></script>
 </body>
