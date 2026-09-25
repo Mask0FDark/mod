@@ -206,9 +206,22 @@ async function messageDetails(messageId, conversationId) {
 }
 
 function emitToUser(userId, payload) {
+  let delivered = 0;
+  const encoded = JSON.stringify(payload);
   for (const ws of socketsByUser.get(userId) || []) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+    if (ws.readyState === WebSocket.OPEN && ws.isAlive !== false) {
+      ws.send(encoded);
+      delivered += 1;
+    }
   }
+  return delivered;
+}
+
+function hasLiveSocket(userId) {
+  for (const ws of socketsByUser.get(userId) || []) {
+    if (ws.readyState === WebSocket.OPEN && ws.isAlive !== false) return true;
+  }
+  return false;
 }
 
 async function emitConversation(conversationId, payload) {
@@ -1226,6 +1239,7 @@ server.on("upgrade", async (req, socket, head) => {
       return socket.destroy();
     }
 
+    socket.setKeepAlive?.(true, 10_000);
     req.user = user;
     wss.handleUpgrade(req, socket, head, ws => wss.emit("connection", ws, req));
   } catch {
@@ -1239,6 +1253,8 @@ wss.on("connection", async (ws, req) => {
   if (!set) socketsByUser.set(userId, (set = new Set()));
   set.add(ws);
   ws.userId = userId;
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
   ws.send(JSON.stringify({ type: "ready", userId }));
 
   const contacts = await db.query(
@@ -1250,7 +1266,7 @@ wss.on("connection", async (ws, req) => {
   );
 
   for (const row of contacts.rows) {
-    if ((socketsByUser.get(row.user_id)?.size || 0) > 0) {
+    if (hasLiveSocket(row.user_id)) {
       ws.send(JSON.stringify({ type: "presence", userId: row.user_id, online: true }));
     }
   }
@@ -1299,6 +1315,15 @@ wss.on("connection", async (ws, req) => {
       );
       if (!allowed.rowCount) return;
 
+      if (msg.type === "call-request" && !hasLiveSocket(to)) {
+        emitToUser(userId, {
+          type: "call-unavailable",
+          from: to,
+          conversationId
+        });
+        return;
+      }
+
       await callHistory.signal(msg,userId,to,conversationId);
       emitToUser(to, {
         type: msg.type,
@@ -1321,6 +1346,21 @@ wss.on("connection", async (ws, req) => {
     }
   });
 });
+
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {
+      ws.terminate();
+    }
+  }
+}, 15_000).unref();
 
 app.use(express.static(webRoot, { etag: true, maxAge: 0, extensions: ["html"] }));
 app.get("*", (req, res) => res.sendFile(path.join(webRoot, "index.html")));

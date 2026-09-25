@@ -1971,7 +1971,15 @@ async function startCall(video) {
 }
 
 async function handleCallSignal(message) {
-  if (!["call-request","call-accept","call-decline","offer","answer","ice","hangup"].includes(message.type)) return;
+  if (!["call-request","call-accept","call-decline","call-unavailable","offer","answer","ice","hangup"].includes(message.type)) return;
+
+  if (message.type === "call-unavailable") {
+    if (state.call.state !== "idle") {
+      showToast(t("offline"));
+      finishCall(false);
+    }
+    return;
+  }
 
   if (message.type === "call-request") {
     if (state.call.state !== "idle") {
