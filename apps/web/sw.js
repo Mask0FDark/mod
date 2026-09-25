@@ -1,4 +1,4 @@
-const CACHE = "m0d-shell-v8-call-recovery";
+const CACHE = "m0d-shell-v9-ui-polish";
 const SHELL = ["/", "/styles.css", "/messenger.css", "/app.js", "/crypto.js", "/i18n.js", "/icon.svg", "/manifest.webmanifest"];
 
 self.addEventListener("install", event => {
