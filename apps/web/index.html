@@ -10,11 +10,12 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/messenger.css">
 </head>
 <body>
   <main id="authView" class="auth-view hidden">
     <section class="auth-card">
-      <div class="logo-mark">M0D</div>
+      <img class="auth-brand-icon" src="/brand-app-icon.svg" alt="M0D">
       <h1>M0D</h1>
       <p class="tagline">Message Over Distance</p>
 
@@ -36,6 +37,10 @@
           <span data-i18n="password">Пароль</span>
           <input id="passwordInput" type="password" minlength="8" maxlength="128" autocomplete="current-password" required>
         </label>
+        <label id="verificationLabel" class="field hidden">
+          <span data-i18n="verificationCode">Код из письма</span>
+          <input id="verificationCodeInput" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code">
+        </label>
         <button id="authSubmit" class="primary-button" type="submit" data-i18n="login">Войти</button>
         <div id="authError" class="form-error"></div>
       </form>
@@ -51,13 +56,21 @@
   <main id="appView" class="messenger hidden">
     <aside id="sidebar" class="sidebar">
       <header class="sidebar-header">
-        <button id="menuButton" class="round-icon" aria-label="Menu">☰</button>
+        <button id="menuButton" class="round-icon vector-icon" aria-label="Menu"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M5 12h14M5 17h14"/></svg></button>
         <div class="brand-small">
-          <strong>M0D</strong>
-          <span>Message Over Distance</span>
+          <img src="/brand-mark.svg" alt="" aria-hidden="true">
+          <div><strong class="desktop-brand-title">M0D</strong><strong class="native-page-title">Чаты</strong><span>Message Over Distance</span></div>
         </div>
-        <button id="newChatButton" class="round-icon accent" aria-label="New chat">✎</button>
+        <button id="mobileSearchButton" class="round-icon native-only vector-icon" type="button" aria-label="Search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg></button>
+        <button id="newChatButton" class="round-icon accent vector-icon" aria-label="New chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button>
       </header>
+
+      <div id="mobileChatFilters" class="mobile-chat-filters native-only" role="tablist" aria-label="Фильтр чатов">
+        <button class="mobile-chat-filter active" type="button" data-filter="all">Все</button>
+        <button class="mobile-chat-filter" type="button" data-filter="direct">Личные</button>
+        <button class="mobile-chat-filter" type="button" data-filter="group">Группы</button>
+        <button class="mobile-chat-filter" type="button" data-filter="channel">Каналы</button>
+      </div>
 
       <div class="search-wrap">
         <span class="search-icon">⌕</span>
@@ -76,34 +89,53 @@
       </footer>
     </aside>
 
+    <nav id="mobileBottomNav" class="mobile-bottom-nav native-only" aria-label="Навигация">
+      <button id="mobileProfileTab" class="mobile-nav-item" type="button"><span class="mobile-nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"></circle><path d="M5.5 20c.7-4 3-6 6.5-6s5.8 2 6.5 6"></path></svg></span><span>Профиль</span></button>
+      <button id="mobileCallsTab" class="mobile-nav-item" type="button"><span class="mobile-nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.5 9 8l-2 2c1.4 3 3.6 5.2 6.6 6.6l2-2 4.4 2.5c.4.2.6.7.5 1.1-.4 1.7-1.8 2.8-3.6 2.8C9.7 21 3 14.3 3 7.1c0-1.8 1.1-3.2 2.8-3.6.3-.1.6 0 .7 0Z"></path></svg></span><span>Звонки</span></button>
+      <button id="mobileChatsTab" class="mobile-nav-item active" type="button"><span class="mobile-nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A3.5 3.5 0 0 1 7.5 2h9A3.5 3.5 0 0 1 20 5.5v7a3.5 3.5 0 0 1-3.5 3.5H10l-5 4v-4.8A3.5 3.5 0 0 1 4 12.5Z"></path></svg></span><span>Чаты</span></button>
+      <button id="mobileSettingsTab" class="mobile-nav-item" type="button"><span class="mobile-nav-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.6 3.2 10.2 1h3.6l.6 2.2 1.8.8 2-1.1 2.5 2.5-1.1 2 .8 1.8 2.2.6v3.6l-2.2.6-.8 1.8 1.1 2-2.5 2.5-2-1.1-1.8.8-.6 2.2h-3.6L9.6 20l-1.8-.8-2 1.1-2.5-2.5 1.1-2-.8-1.8-2.2-.6V9.8l2.2-.6.8-1.8-1.1-2 2.5-2.5 2 1.1Z"></path><circle cx="12" cy="11.6" r="3.1"></circle></svg></span><span>Настройки</span></button>
+    </nav>
+
     <section id="chatPane" class="chat-pane empty">
       <div id="emptyChat" class="empty-chat">
-        <div class="empty-logo">M0D</div>
+        <div class="empty-logo"><img src="/brand-mark.svg" alt="M0D"></div>
         <h2 data-i18n="selectChat">Выберите чат</h2>
         <p data-i18n="selectChatHint">или создайте новый диалог</p>
       </div>
 
       <div id="activeChat" class="active-chat hidden">
         <header class="chat-header">
-          <button id="backButton" class="round-icon mobile-only" aria-label="Back">‹</button>
+          <button id="backButton" class="round-icon mobile-only vector-icon" aria-label="Back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg></button>
           <div id="chatAvatar" class="avatar">?</div>
           <div class="chat-title-wrap">
             <strong id="chatTitle">Chat</strong>
             <span id="chatStatus" data-i18n="offline">не в сети</span>
           </div>
-          <button id="audioCallButton" class="round-icon" aria-label="Audio call" title="Audio call">☎</button>
-          <button id="videoCallButton" class="round-icon" aria-label="Video call" title="Video call">◉</button>
+          <button id="audioCallButton" class="round-icon vector-icon" aria-label="Audio call" title="Audio call"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.8 3.5 9.1 8l-2 2.1c1.5 3 3.7 5.2 6.8 6.6l2-2.1 4.4 2.5c.5.3.7.8.6 1.3-.5 1.7-1.9 2.7-3.8 2.7C9.7 21.1 2.9 14.3 2.9 6.9c0-1.8 1-3.2 2.8-3.7.4-.1.8 0 1.1.3Z"/></svg></button>
+          <button id="videoCallButton" class="round-icon vector-icon" aria-label="Video call" title="Video call"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="6" width="12" height="12" rx="3"/><path d="m15.5 10 5-3v10l-5-3Z"/></svg></button>
+          <button id="chatInfoButton" class="round-icon vector-icon" aria-label="Chat info" title="Chat info"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/></svg></button>
         </header>
 
+        <button id="pinnedMessageBar" class="pinned-message-bar hidden" type="button"></button>
         <section id="messageList" class="message-list"></section>
 
         <footer class="composer">
-          <input id="fileInput" type="file" hidden accept="image/*,video/*,audio/*,.pdf,.txt,.zip">
-          <button id="attachButton" class="composer-icon" aria-label="Attach">⌕</button>
+          <input id="fileInput" type="file" hidden multiple>
+          <button id="attachButton" class="composer-icon vector-icon" aria-label="Attach"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 12.5 5.9-5.9a3.2 3.2 0 1 1 4.5 4.5l-8.1 8.1a5 5 0 0 1-7.1-7.1l8.1-8.1"/><path d="m7.5 14.5 7.1-7.1"/></svg></button>
           <div class="composer-box">
+            <div id="composerContext" class="composer-context hidden">
+              <div>
+                <strong id="composerContextTitle"></strong>
+                <span id="composerContextText"></span>
+              </div>
+              <button id="cancelComposerContext" class="context-close" type="button">✕</button>
+            </div>
             <textarea id="messageInput" rows="1" maxlength="12000" data-i18n-placeholder="message" placeholder="Сообщение"></textarea>
+            <div id="readOnlyHint" class="read-only-hint hidden" data-i18n="channelReadOnly">Публиковать могут только администраторы</div>
           </div>
-          <button id="sendButton" class="send-button" aria-label="Send">➤</button>
+          <button id="emojiButton" class="composer-icon vector-icon" type="button" aria-label="Emoji"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M8.5 10h.01M15.5 10h.01M8.5 14.2c1 1.2 2.1 1.8 3.5 1.8s2.5-.6 3.5-1.8"/></svg></button>
+          <button id="voiceMessageButton" class="composer-icon vector-icon" type="button" aria-label="Voice message"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M6.5 11.5a5.5 5.5 0 0 0 11 0M12 17v3.5M9 20.5h6"/></svg></button>
+          <button id="sendButton" class="send-button vector-icon" aria-label="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 5 16 7-16 7 2.4-6.2L15 12 6.4 11.2Z"/></svg></button>
         </footer>
       </div>
     </section>
@@ -125,6 +157,10 @@
           <button class="language-button" type="button" data-lang="uk">Українська</button>
         </div>
       </div>
+      <div class="drawer-section">
+        <span data-i18n="notifications">Уведомления</span>
+        <button id="enableNotificationsButton" class="settings-action" type="button" data-i18n="enableNotifications">Включить уведомления</button>
+      </div>
       <div class="drawer-note">
         <strong data-i18n="privacy">Конфиденциальность</strong>
         <p data-i18n="encryptionNote">Сообщения и вложения шифруются в браузере до отправки на сервер.</p>
@@ -137,22 +173,96 @@
       <header>
         <div>
           <h2 data-i18n="newChat">Новый чат</h2>
-          <p data-i18n="newChatHint">Введите email одного или нескольких пользователей.</p>
+          <p data-i18n="newChatHint">Создайте приватную ссылку-приглашение.</p>
         </div>
         <button id="closeNewChatButton" class="round-icon">✕</button>
       </header>
       <label class="field">
-        <span data-i18n="emails">Email участников</span>
-        <textarea id="memberEmailsInput" rows="3" placeholder="name@example.com"></textarea>
+        <span data-i18n="chatType">Тип чата</span>
+        <select id="inviteKindInput">
+          <option value="direct" data-i18n="directChat">Личный чат</option>
+          <option value="group" data-i18n="groupChat">Группа</option>
+          <option value="channel" data-i18n="channel">Канал</option>
+        </select>
       </label>
-      <label class="field">
-        <span data-i18n="groupName">Название группы</span>
-        <input id="groupTitleInput" maxlength="40" data-i18n-placeholder="optional" placeholder="Необязательно">
+      <label id="groupTitleLabel" class="field hidden">
+        <span data-i18n="groupName">Название</span>
+        <input id="groupTitleInput" maxlength="40" data-i18n-placeholder="groupNamePlaceholder" placeholder="Название">
       </label>
-      <p class="modal-help" data-i18n="groupAutoHint">Один email создаст личный чат. Несколько — группу.</p>
+      <label id="descriptionLabel" class="field hidden">
+        <span data-i18n="description">Описание</span>
+        <textarea id="descriptionInput" rows="3" maxlength="500" data-i18n-placeholder="descriptionPlaceholder" placeholder="Описание"></textarea>
+      </label>
+      <p id="newChatHelp" class="modal-help" data-i18n="invitePrivacyHint">Email собеседника не нужен. Отправьте ему ссылку — после входа или регистрации он сразу попадёт в чат.</p>
+      <div id="inviteResult" class="invite-result hidden">
+        <input id="inviteLinkInput" readonly>
+        <button id="copyInviteButton" class="primary-button" type="button" data-i18n="copyLink">Копировать ссылку</button>
+      </div>
       <div id="newChatError" class="form-error"></div>
-      <button id="createChatButton" class="primary-button" data-i18n="create">Создать</button>
+      <button id="createChatButton" class="primary-button" data-i18n="createInvite">Создать ссылку</button>
     </div>
+  </div>
+
+  <div id="chatInfoModal" class="modal hidden">
+    <div class="modal-card info-card">
+      <header>
+        <div>
+          <h2 id="infoTitle">M0D</h2>
+          <p id="infoSubtitle"></p>
+        </div>
+        <button id="closeChatInfoButton" class="round-icon">✕</button>
+      </header>
+
+      <div id="infoDescription" class="info-description"></div>
+      <div class="info-actions">
+        <button id="shareInviteButton" class="primary-button" type="button" data-i18n="invitePeople">Пригласить</button>
+        <button id="editConversationButton" class="secondary-button hidden" type="button" data-i18n="editChat">Изменить</button>
+      </div>
+      <div class="info-actions">
+        <button id="muteConversationButton" class="secondary-button" type="button" data-i18n="muteChat">Выключить уведомления</button>
+        <button id="toggleCommentsButton" class="secondary-button hidden" type="button" data-i18n="disableComments">Отключить комментарии</button>
+      </div>
+
+      <div id="infoInviteResult" class="invite-result hidden">
+        <input id="infoInviteLink" readonly>
+        <button id="copyInfoInviteButton" class="primary-button" type="button" data-i18n="copyLink">Копировать ссылку</button>
+      </div>
+
+      <div class="info-section">
+        <div class="info-section-title">
+          <strong data-i18n="membersTitle">Участники</strong>
+          <span id="memberCount"></span>
+        </div>
+        <div id="memberList" class="member-list"></div>
+      </div>
+
+      <button id="leaveConversationButton" class="danger-text-button" type="button" data-i18n="leaveChat">Покинуть</button>
+    </div>
+  </div>
+
+  <div id="threadModal" class="modal thread-modal hidden">
+    <div class="modal-card thread-card">
+      <header>
+        <div>
+          <h2 data-i18n="comments">Комментарии</h2>
+          <p id="threadSubtitle"></p>
+        </div>
+        <button id="closeThreadButton" class="round-icon">✕</button>
+      </header>
+      <section id="threadMessageList" class="thread-message-list"></section>
+      <footer class="thread-composer">
+        <textarea id="threadInput" rows="1" maxlength="12000" data-i18n-placeholder="commentPlaceholder" placeholder="Комментарий"></textarea>
+        <button id="threadSendButton" class="send-button" type="button">➤</button>
+      </footer>
+    </div>
+  </div>
+
+  <div id="mobileCallsView" class="mobile-sheet native-only hidden">
+    <header class="mobile-sheet-header">
+      <div><h2>Звонки</h2><p>История голосовых и видеозвонков</p></div>
+      <button id="closeMobileCallsButton" class="round-icon" type="button">✕</button>
+    </header>
+    <section id="mobileCallsList" class="mobile-calls-list"></section>
   </div>
 
   <div id="callOverlay" class="call-overlay hidden">
@@ -186,7 +296,22 @@
     </footer>
   </div>
 
+  <div id="callMiniBar" class="call-mini hidden" role="region" aria-label="Активный звонок">
+    <button id="restoreCallButton" class="call-mini-main" type="button">
+      <span class="call-mini-pulse" aria-hidden="true"></span>
+      <span class="call-mini-copy">
+        <strong id="callMiniName">—</strong>
+        <span id="callMiniStatus">—</span>
+      </span>
+      <span class="call-mini-expand" aria-hidden="true">↗</span>
+    </button>
+    <button id="miniMicButton" class="call-mini-control" type="button" aria-label="Микрофон">🎙</button>
+    <button id="miniEndCallButton" class="call-mini-control danger" type="button" aria-label="Завершить звонок">☎</button>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
+  <script src="/compat.js"></script>
+  <script nomodule src="/app.legacy.js"></script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

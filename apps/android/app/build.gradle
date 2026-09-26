@@ -2,9 +2,16 @@ plugins {
     id "com.android.application"
 }
 
+def m0dBaseUrl = System.getenv("M0D_BASE_URL") ?:
+        (project.findProperty("M0D_BASE_URL") ?: "https://m0d-dev.mask-0f-darkness.ru/")
+
 android {
     namespace "online.mask0fdark.m0d"
     compileSdk 34
+
+    buildFeatures {
+        buildConfig true
+    }
 
     defaultConfig {
         applicationId "online.mask0fdark.m0d"
@@ -12,6 +19,7 @@ android {
         targetSdk 34
         versionCode 1
         versionName "0.1.0"
+        buildConfigField "String", "M0D_BASE_URL", "\"" + m0dBaseUrl + "\""
     }
 
     buildTypes {
