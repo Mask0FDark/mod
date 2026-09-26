@@ -14,6 +14,8 @@ import android.os.IBinder;
 import android.os.PowerManager;
 
 public class CallForegroundService extends Service {
+    public static final String ACTION_START = "site.m0d.messenger.call.START";
+    public static final String EXTRA_VIDEO = "video";
     private static final String CHANNEL_ID = "active_calls";
     private static final int NOTIFICATION_ID = 2026;
 
