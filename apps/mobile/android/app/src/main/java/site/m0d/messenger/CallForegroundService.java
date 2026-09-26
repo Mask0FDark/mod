@@ -8,45 +8,28 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
-import android.media.AudioManager;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 
 public class CallForegroundService extends Service {
-    public static final String ACTION_START = "site.m0d.messenger.call.START";
-    public static final String ACTION_STOP = "site.m0d.messenger.call.STOP";
-    public static final String EXTRA_VIDEO = "video";
-
     private static final String CHANNEL_ID = "active_calls";
     private static final int NOTIFICATION_ID = 2026;
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
-    private AudioManager audioManager;
-    private AudioFocusRequest audioFocusRequest;
 
     @Override
     public void onCreate() {
         super.onCreate();
-        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         createNotificationChannel();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
-            stopCallMode();
-            stopSelf();
-            return START_NOT_STICKY;
-        }
-
-        boolean video = intent != null && intent.getBooleanExtra(EXTRA_VIDEO, false);
+        boolean video = intent != null && intent.getBooleanExtra("video", false);
         acquireLocks();
-        requestCallAudioFocus();
         startAsForeground(video);
         return START_NOT_STICKY;
     }
@@ -76,7 +59,7 @@ public class CallForegroundService extends Service {
         return builder
             .setSmallIcon(R.drawable.ic_stat_m0d)
             .setContentTitle("M0D")
-            .setContentText(video ? "Идёт видеозвонок" : "Идёт звонок")
+            .setContentText(video ? "Video call in progress" : "Call in progress")
             .setContentIntent(contentIntent)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_CALL)
@@ -89,10 +72,10 @@ public class CallForegroundService extends Service {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
         NotificationChannel channel = new NotificationChannel(
             CHANNEL_ID,
-            "Активные звонки",
+            "Active calls",
             NotificationManager.IMPORTANCE_LOW
         );
-        channel.setDescription("Поддерживает активный звонок M0D в фоне");
+        channel.setDescription("Keeps an active M0D call running in the background");
         channel.setSound(null, null);
         channel.enableVibration(false);
         NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
@@ -115,42 +98,15 @@ public class CallForegroundService extends Service {
         if (!wifiLock.isHeld()) wifiLock.acquire();
     }
 
-    private void requestCallAudioFocus() {
-        if (audioManager == null) return;
-        audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            AudioAttributes attributes = new AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build();
-            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(attributes)
-                .setAcceptsDelayedFocusGain(false)
-                .build();
-            audioManager.requestAudioFocus(audioFocusRequest);
-        } else {
-            audioManager.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT);
-        }
-    }
-
-    private void stopCallMode() {
+    private void releaseLocks() {
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
-
-        if (audioManager != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioFocusRequest != null) {
-                audioManager.abandonAudioFocusRequest(audioFocusRequest);
-            } else {
-                audioManager.abandonAudioFocus(null);
-            }
-        }
         stopForeground(true);
     }
 
     @Override
     public void onDestroy() {
-        stopCallMode();
+        releaseLocks();
         super.onDestroy();
     }
 

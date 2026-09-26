@@ -2138,7 +2138,6 @@ async function repairActiveCallMedia() {
   state.call.mediaRepairing = true;
   try {
     connectSocket();
-    await startNativeCallKeepAlive(state.call.video);
     const pc = state.call.pc;
     if (pc && pc.connectionState !== "connected") scheduleCallRecovery(250);
 
